@@ -221,13 +221,18 @@ Return ONLY valid JSON.
 
     # Estimate minutes
     effort = 45
-    min_match = re.search(r'(\d+)\s*(?:hour|hr|h)', lower)
+    word_nums = {"an": 1, "a": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "half": 0.5}
+    min_match = re.search(r'\b(an|a|one|two|three|four|five|\d+)\s*(?:hour|hours|hr|hrs|h)\b', lower)
     if min_match:
-        effort = int(min_match.group(1)) * 60
+        val_str = min_match.group(1)
+        val = word_nums.get(val_str, float(val_str) if val_str.isdigit() else 1)
+        effort = int(val * 60)
     else:
-        min_match2 = re.search(r'(\d+)\s*(?:minute|min|m)', lower)
+        min_match2 = re.search(r'\b(ten|fifteen|twenty|thirty|forty-five|\d+)\s*(?:minute|minutes|min|mins|m)\b', lower)
         if min_match2:
-            effort = int(min_match2.group(1))
+            val_str = min_match2.group(1)
+            min_words = {"ten": 10, "fifteen": 15, "twenty": 20, "thirty": 30, "forty-five": 45}
+            effort = min_words.get(val_str, int(val_str) if val_str.isdigit() else 30)
 
     # Reward calculation
     base_xp = 50 + (effort // 10) * 5
