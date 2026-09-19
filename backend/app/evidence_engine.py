@@ -97,6 +97,32 @@ def extract_file_text_safe(file_path: str, max_chars: int = 20000) -> str:
         
     return f"[Uploaded artifact {os.path.basename(file_path)} received]"
 
+safe_fetch_url = fetch_url_content_safe
+
+def extract_text_from_file_data(data: bytes, filename: str, max_chars: int = 20000) -> str:
+    fn = filename.lower()
+    text_extensions = ('.txt', '.md', '.py', '.js', '.json', '.html', '.css', '.csv', '.log', '.yaml', '.yml')
+    if any(fn.endswith(ext) for ext in text_extensions):
+        try:
+            return data.decode('utf-8', errors='ignore')[:max_chars]
+        except Exception:
+            return "[Text decoding error]"
+    if fn.endswith('.pdf'):
+        try:
+            text_matches = re.findall(b'BT(.*?)ET', data[:max_chars * 2], re.DOTALL)
+            extracted = []
+            for m in text_matches[:30]:
+                cleaned = re.sub(b'[^a-zA-Z0-9 .,:;!?()\n\r-]', b'', m)
+                extracted.append(cleaned.decode('latin1', errors='ignore'))
+            if extracted:
+                return " ".join(extracted)[:max_chars]
+            return "[PDF Document captured. Contains layout/graphics]"
+        except Exception:
+            return "[PDF Document captured for review]"
+    if any(fn.endswith(ext) for ext in ('.png', '.jpg', '.jpeg', '.webp', '.gif')):
+        return f"[Visual proof screenshot attached. Size: {len(data) // 1024} KB]"
+    return f"[Uploaded artifact {filename} received: {len(data) // 1024} KB]"
+
 def evaluate_evidence_deterministic(
     quest_title: str,
     quest_type: str,
