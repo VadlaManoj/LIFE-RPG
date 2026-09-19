@@ -157,6 +157,7 @@ def evaluate_evidence_deterministic(
     if is_prompt_injection:
         return EvidenceEvaluationResult(
             relevant=False,
+            relevance=0.1,
             quality=0.1,
             confidence=0.95,
             completeness=0.1,
@@ -168,6 +169,7 @@ def evaluate_evidence_deterministic(
     if len(text) < 15 and not github_activity:
         return EvidenceEvaluationResult(
             relevant=False,
+            relevance=0.2,
             quality=0.25,
             confidence=0.85,
             completeness=0.2,
@@ -246,6 +248,7 @@ def evaluate_evidence_deterministic(
 
     return EvidenceEvaluationResult(
         relevant=(relevance_score >= 0.5),
+        relevance=round(relevance_score, 2),
         quality=round(quality_score, 2),
         confidence=0.85,
         completeness=round(completeness_score, 2),
@@ -287,6 +290,7 @@ Evidence Kind: {evidence_kind}
 Evaluate whether the evidence legitimately demonstrates completion or substantial progress on the quest.
 Return valid JSON only with keys:
 - "relevant": boolean
+- "relevance": float between 0.0 and 1.0
 - "quality": float between 0.0 and 1.0
 - "confidence": float between 0.0 and 1.0
 - "completeness": float between 0.0 and 1.0
@@ -297,9 +301,11 @@ Return valid JSON only with keys:
     try:
         res = await ai_json_func(prompt, fallback.model_dump())
         if isinstance(res, dict) and "quality" in res and "relevant" in res:
+            q_val = max(0.0, min(1.0, float(res.get("quality", 0.7))))
             return EvidenceEvaluationResult(
                 relevant=bool(res.get("relevant", True)),
-                quality=max(0.0, min(1.0, float(res.get("quality", 0.7)))),
+                relevance=max(0.0, min(1.0, float(res.get("relevance", q_val)))),
+                quality=q_val,
                 confidence=max(0.0, min(1.0, float(res.get("confidence", 0.8)))),
                 completeness=max(0.0, min(1.0, float(res.get("completeness", 0.7)))),
                 supports_quest=bool(res.get("supports_quest", True)),
