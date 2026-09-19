@@ -6,6 +6,7 @@ import httpx
 
 class EvidenceEvaluationResult(BaseModel):
     relevant: bool = True
+    relevance: float = Field(default=0.7, ge=0.0, le=1.0)
     quality: float = Field(default=0.7, ge=0.0, le=1.0)
     confidence: float = Field(default=0.8, ge=0.0, le=1.0)
     completeness: float = Field(default=0.7, ge=0.0, le=1.0)
