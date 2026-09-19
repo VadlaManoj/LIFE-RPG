@@ -1149,14 +1149,269 @@ def social(s:Session=Depends(db),u:User=Depends(current_user)):
 @app.post('/api/social/friends')
 def add_friend(x:FriendIn,s:Session=Depends(db),u:User=Depends(current_user)): f=Friend(user_id=u.id,name=x.name.strip() or 'Friend'); s.add(f); s.commit(); return clean(f)
 
+def clean_integration(i: Integration):
+    data = clean(i)
+    data.pop('access_token_enc', None)
+    data.pop('refresh_token_enc', None)
+    if 'metadata_json' in data and data['metadata_json']:
+        try:
+            data['metadata'] = json.loads(data['metadata_json'])
+        except Exception:
+            data['metadata'] = {}
+    else:
+        data['metadata'] = {}
+    return data
+
 @app.get('/api/integrations')
-def integrations(s:Session=Depends(db),u:User=Depends(current_user)): seed_integrations(s,u); s.commit(); return [clean(x) for x in s.query(Integration).filter_by(user_id=u.id).all()]
+def list_integrations(s:Session=Depends(db),u:User=Depends(current_user)):
+    seed_integrations(s,u)
+    s.commit()
+    rows = s.query(Integration).filter_by(user_id=u.id).all()
+    return [clean_integration(x) for x in rows]
 
 @app.post('/api/integrations')
 def set_integration(x:IntegrationIn,s:Session=Depends(db),u:User=Depends(current_user)):
     i=s.query(Integration).filter_by(user_id=u.id,provider=x.provider).first()
-    if not i: i=Integration(user_id=u.id,provider=x.provider); s.add(i)
-    i.connected=x.connected; i.updated_at=datetime.utcnow(); s.commit(); return clean(i)
+    if not i:
+        i=Integration(user_id=u.id,provider=x.provider)
+        s.add(i)
+    i.connected=x.connected
+    i.status='connected' if x.connected else 'disconnected'
+    if not x.connected:
+        i.access_token_enc=''
+        i.refresh_token_enc=''
+    i.updated_at=datetime.utcnow()
+    s.commit()
+    return clean_integration(i)
+
+@app.get('/api/integrations/{provider}/auth-url')
+def get_auth_url_endpoint(provider: str, redirect_uri: str = 'http://localhost:5173/integrations', state: Optional[str] = None, u: User=Depends(current_user)):
+    prov = get_provider(provider)
+    if not prov:
+        raise HTTPException(404, f"Provider '{provider}' not supported.")
+    state_token = state or f"{u.id}_{secrets.token_hex(8)}"
+    return {
+        "provider": prov.name,
+        "auth_url": prov.get_auth_url(redirect_uri, state_token),
+        "state": state_token
+    }
+
+class CallbackIn(BaseModel):
+    code: str
+    state: Optional[str] = None
+    redirect_uri: Optional[str] = None
+
+@app.post('/api/integrations/{provider}/callback')
+async def oauth_callback_endpoint(provider: str, x: CallbackIn, s: Session=Depends(db), u: User=Depends(current_user)):
+    prov = get_provider(provider)
+    if not prov:
+        raise HTTPException(404, f"Provider '{provider}' not supported.")
+    
+    # State ownership check
+    if x.state and not x.state.startswith(f"{u.id}_") and not x.state.startswith("demo_"):
+        raise HTTPException(403, "Invalid OAuth state parameter. Request rejected.")
+        
+    try:
+        data = await prov.exchange_code(x.code, x.redirect_uri or 'http://localhost:5173/integrations')
+    except Exception as exc:
+        raise HTTPException(400, f"OAuth token exchange failed: {str(exc)}")
+        
+    it = s.query(Integration).filter_by(user_id=u.id, provider=prov.name).first()
+    if not it:
+        it = Integration(user_id=u.id, provider=prov.name)
+        s.add(it)
+    it.connected = True
+    it.status = 'connected'
+    it.connected_at = datetime.utcnow()
+    it.external_user_id = data.get('external_user_id', '')
+    it.scopes = data.get('scopes', '')
+    if 'access_token' in data:
+        it.access_token_enc = encrypt_token(data['access_token'])
+    if 'refresh_token' in data and data['refresh_token']:
+        it.refresh_token_enc = encrypt_token(data['refresh_token'])
+    it.error_message = ''
+    it.updated_at = datetime.utcnow()
+    
+    # Run initial sync automatically
+    try:
+        token = data.get('access_token', '')
+        sync_data = await prov.sync(token)
+        it.last_sync_at = datetime.utcnow()
+        it.sync_status = 'synced'
+        it.metadata_json = json.dumps(sync_data)
+    except Exception:
+        it.sync_status = 'idle'
+        
+    s.commit()
+    notify(s, u, f"{prov.name} Connected", f"Successfully linked your {prov.name} account to LIFE RPG.", "integration")
+    return clean_integration(it)
+
+@app.post('/api/integrations/{provider}/sync')
+async def sync_integration_endpoint(provider: str, s: Session=Depends(db), u: User=Depends(current_user)):
+    prov = get_provider(provider)
+    if not prov:
+        raise HTTPException(404, f"Provider '{provider}' not supported.")
+    it = s.query(Integration).filter_by(user_id=u.id, provider=prov.name).first()
+    if not it or not it.connected:
+        raise HTTPException(400, f"{provider} is not connected.")
+        
+    token = decrypt_token(it.access_token_enc) if it.access_token_enc else ""
+    try:
+        sync_result = await prov.sync(token)
+        it.last_sync_at = datetime.utcnow()
+        it.sync_status = 'synced'
+        it.error_message = ''
+        it.metadata_json = json.dumps(sync_result)
+        it.updated_at = datetime.utcnow()
+        s.commit()
+        return {
+            "provider": prov.name,
+            "status": "synced",
+            "last_sync_at": it.last_sync_at.isoformat() if it.last_sync_at else None,
+            "data": sync_result
+        }
+    except Exception as exc:
+        it.sync_status = 'failed'
+        it.error_message = str(exc)
+        s.commit()
+        raise HTTPException(502, f"Sync error: {str(exc)}")
+
+@app.post('/api/integrations/{provider}/disconnect')
+def disconnect_integration_endpoint(provider: str, s: Session=Depends(db), u: User=Depends(current_user)):
+    prov = get_provider(provider)
+    prov_name = prov.name if prov else provider
+    it = s.query(Integration).filter_by(user_id=u.id, provider=prov_name).first()
+    if not it:
+        raise HTTPException(404, f"Integration '{provider}' not found.")
+    it.connected = False
+    it.status = 'disconnected'
+    it.access_token_enc = ''
+    it.refresh_token_enc = ''
+    it.sync_status = 'idle'
+    it.metadata_json = '{}'
+    it.updated_at = datetime.utcnow()
+    s.commit()
+    notify(s, u, f"{prov_name} Disconnected", f"Disconnected {prov_name} from your profile.", "integration")
+    return clean_integration(it)
+
+@app.get('/api/integrations/calendar/deadlines')
+def get_calendar_deadlines(s: Session=Depends(db), u: User=Depends(current_user)):
+    deadlines = []
+    for prov_name in ['Google Calendar', 'Outlook Calendar']:
+        it = s.query(Integration).filter_by(user_id=u.id, provider=prov_name, connected=True).first()
+        if it and it.metadata_json:
+            try:
+                meta = json.loads(it.metadata_json)
+                for dl in meta.get('deadlines', []):
+                    dl['provider'] = prov_name
+                    deadlines.append(dl)
+            except Exception:
+                pass
+    return deadlines
+
+@app.get('/api/integrations/github/activity')
+def get_github_activity(s: Session=Depends(db), u: User=Depends(current_user)):
+    it = s.query(Integration).filter_by(user_id=u.id, provider='GitHub', connected=True).first()
+    if not it or not it.metadata_json:
+        return {"connected": bool(it and it.connected), "items": [], "summary": "No GitHub activity recorded."}
+    try:
+        meta = json.loads(it.metadata_json)
+        return {"connected": True, "items": meta.get("items", []), "summary": meta.get("summary", ""), "last_active_repo": meta.get("last_active_repo")}
+    except Exception:
+        return {"connected": True, "items": [], "summary": "Error loading activity."}
+
+@app.post('/api/integrations/fitness/activity')
+async def record_fitness_activity(activity: FitnessActivityInput, s: Session=Depends(db), u: User=Depends(current_user)):
+    prov = get_provider('Fitness')
+    result = await prov.record_activity(activity) # type: ignore
+    habit_q = s.query(Quest).join(Goal).filter(
+        Goal.user_id == u.id,
+        Quest.status == 'available',
+        (Quest.category == 'Fitness') | (Quest.quest_type == 'habit') | (Quest.title.ilike(f'%{activity.activity_type}%'))
+    ).first()
+    
+    awarded_xp = result['earned_xp']
+    awarded_coins = result['earned_coins']
+    old_lvl, new_lvl = add_xp(u, awarded_xp)
+    u.coins += awarded_coins
+    touch(u)
+    
+    if habit_q:
+        e = Evidence(
+            quest_id=habit_q.id,
+            user_id=u.id,
+            kind='fitness',
+            value=result['summary'],
+            evaluation=f"Fitness tracker verified {activity.duration_minutes}m of {activity.activity_type}.",
+            quality=85.0,
+            relevance=0.95,
+            confidence=0.9,
+            completeness=0.85,
+            supports_quest=True,
+            feedback=f"Fitness logged: {activity.duration_minutes}m activity toward {habit_q.title}."
+        )
+        s.add(e)
+        
+    it = s.query(Integration).filter_by(user_id=u.id, provider='Fitness').first()
+    if it:
+        it.connected = True
+        it.status = 'connected'
+        it.last_sync_at = datetime.utcnow()
+        it.metadata_json = json.dumps({"latest_activity": result})
+        
+    notify(s, u, 'Fitness Activity Recorded', result['summary'], 'fitness')
+    s.commit()
+    return {
+        "ok": True,
+        "result": result,
+        "quest_updated": clean(habit_q) if habit_q else None,
+        "earned_xp": awarded_xp,
+        "earned_coins": awarded_coins,
+        "level": u.level,
+        "leveled_up": new_lvl > old_lvl
+    }
+
+class GoalParseIn(BaseModel):
+    text: str
+
+@app.post('/api/goals/parse')
+def parse_goal_endpoint(x: GoalParseIn, u: User=Depends(current_user)):
+    return parse_natural_language_goal(x.text)
+
+@app.get('/api/recommendations')
+def get_recommendations_endpoint(s: Session=Depends(db), u: User=Depends(current_user)):
+    active_quests = s.query(Quest).join(Goal).filter(Goal.user_id == u.id, Quest.status.in_(['available', 'in_progress'])).order_by(Quest.order_index).limit(10).all()
+    deadlines = []
+    for prov_name in ['Google Calendar', 'Outlook Calendar']:
+        it = s.query(Integration).filter_by(user_id=u.id, provider=prov_name, connected=True).first()
+        if it and it.metadata_json:
+            try:
+                meta = json.loads(it.metadata_json)
+                for dl in meta.get('deadlines', []):
+                    dl['provider'] = prov_name
+                    deadlines.append(dl)
+            except Exception:
+                pass
+    
+    weak_skills_rows = s.query(TopicSkill).filter(TopicSkill.user_id == u.id, TopicSkill.mastery < 65.0).order_by(TopicSkill.mastery.asc()).all()
+    weak_skills = [w.topic for w in weak_skills_rows]
+    
+    gh_it = s.query(Integration).filter_by(user_id=u.id, provider='GitHub', connected=True).first()
+    gh_repo = None
+    if gh_it and gh_it.metadata_json:
+        try:
+            gh_meta = json.loads(gh_it.metadata_json)
+            gh_repo = gh_meta.get('last_active_repo')
+        except Exception:
+            pass
+            
+    return generate_personalized_recommendations(
+        active_quests=[clean(q) for q in active_quests],
+        deadlines=deadlines,
+        weak_skills=weak_skills,
+        github_active_repo=gh_repo
+    )
+
 
 @app.get('/api/notifications')
 def notifications(s:Session=Depends(db),u:User=Depends(current_user)): return [clean(x) for x in s.query(Notification).filter_by(user_id=u.id).order_by(Notification.id.desc()).limit(30).all()]
