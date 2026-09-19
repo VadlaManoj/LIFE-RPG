@@ -19,6 +19,19 @@ from app.quiz_engine import (
 )
 from app.evaluation_engine import evaluate_submission
 from app.adaptive_engine import update_topic_skill, decide_adaptive_progression
+from app.evidence_engine import (
+    evaluate_evidence_with_ai, evaluate_evidence_deterministic, safe_fetch_url,
+    extract_text_from_file_data, EvidenceEvaluationResult
+)
+from app.nlp_engine import (
+    parse_natural_language_goal, NaturalLanguageParseResult
+)
+from app.integrations_engine import (
+    get_provider, PROVIDERS, encrypt_token, decrypt_token, FitnessActivityInput, FitnessProvider
+)
+from app.recommendation_engine import (
+    generate_personalized_recommendations, RecommendationResponse
+)
 
 load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent.parent
