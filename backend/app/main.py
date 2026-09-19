@@ -95,7 +95,8 @@ class Quiz(Base):
 
 class Evidence(Base):
     __tablename__='evidence'
-    id=Column(Integer,primary_key=True); quest_id=Column(Integer,ForeignKey('quests.id')); user_id=Column(Integer,ForeignKey('users.id')); kind=Column(String); value=Column(Text); filename=Column(String,default=''); evaluation=Column(Text,default=''); quality=Column(Float,default=0); created_at=Column(DateTime,default=datetime.utcnow)
+    id=Column(Integer,primary_key=True); quest_id=Column(Integer,ForeignKey('quests.id')); user_id=Column(Integer,ForeignKey('users.id')); kind=Column(String); value=Column(Text); filename=Column(String,default=''); evaluation=Column(Text,default=''); quality=Column(Float,default=0)
+    relevance=Column(Float,default=0.0); confidence=Column(Float,default=0.0); completeness=Column(Float,default=0.0); supports_quest=Column(Boolean,default=False); feedback=Column(Text,default=''); missing_requirements_json=Column(Text,default='[]'); created_at=Column(DateTime,default=datetime.utcnow)
 
 class Inventory(Base):
     __tablename__='inventory'
@@ -119,7 +120,8 @@ class Challenge(Base):
 
 class Integration(Base):
     __tablename__='integrations'
-    id=Column(Integer,primary_key=True); user_id=Column(Integer,ForeignKey('users.id')); provider=Column(String); connected=Column(Boolean,default=False); updated_at=Column(DateTime,default=datetime.utcnow)
+    id=Column(Integer,primary_key=True); user_id=Column(Integer,ForeignKey('users.id')); provider=Column(String); connected=Column(Boolean,default=False)
+    status=Column(String,default='disconnected'); external_user_id=Column(String,default=''); scopes=Column(String,default=''); connected_at=Column(DateTime,nullable=True); last_sync_at=Column(DateTime,nullable=True); sync_status=Column(String,default='idle'); error_message=Column(Text,default=''); access_token_enc=Column(Text,default=''); refresh_token_enc=Column(Text,default=''); metadata_json=Column(Text,default='{}'); updated_at=Column(DateTime,default=datetime.utcnow)
 
 class Notification(Base):
     __tablename__='notifications'
@@ -141,6 +143,39 @@ def ensure_schema():
         for col_name, col_def in new_cols:
             if col_name not in cols:
                 conn.exec_driver_sql(f"ALTER TABLE quests ADD COLUMN {col_name} {col_def}")
+
+        res_ev = conn.exec_driver_sql("PRAGMA table_info(evidence)")
+        ev_cols = [row[1] for row in res_ev.fetchall()]
+        new_ev_cols = [
+            ("relevance", "FLOAT DEFAULT 0.0"),
+            ("confidence", "FLOAT DEFAULT 0.0"),
+            ("completeness", "FLOAT DEFAULT 0.0"),
+            ("supports_quest", "BOOLEAN DEFAULT 0"),
+            ("feedback", "TEXT DEFAULT ''"),
+            ("missing_requirements_json", "TEXT DEFAULT '[]'")
+        ]
+        for col_name, col_def in new_ev_cols:
+            if col_name not in ev_cols:
+                conn.exec_driver_sql(f"ALTER TABLE evidence ADD COLUMN {col_name} {col_def}")
+
+        res_int = conn.exec_driver_sql("PRAGMA table_info(integrations)")
+        int_cols = [row[1] for row in res_int.fetchall()]
+        new_int_cols = [
+            ("status", "VARCHAR DEFAULT 'disconnected'"),
+            ("external_user_id", "VARCHAR DEFAULT ''"),
+            ("scopes", "VARCHAR DEFAULT ''"),
+            ("connected_at", "DATETIME"),
+            ("last_sync_at", "DATETIME"),
+            ("sync_status", "VARCHAR DEFAULT 'idle'"),
+            ("error_message", "TEXT DEFAULT ''"),
+            ("access_token_enc", "TEXT DEFAULT ''"),
+            ("refresh_token_enc", "TEXT DEFAULT ''"),
+            ("metadata_json", "TEXT DEFAULT '{}'")
+        ]
+        for col_name, col_def in new_int_cols:
+            if col_name not in int_cols:
+                conn.exec_driver_sql(f"ALTER TABLE integrations ADD COLUMN {col_name} {col_def}")
+
         conn.commit()
 
 ensure_schema()
@@ -751,6 +786,16 @@ def quest_complete(qid:int,x:CompleteIn,s:Session=Depends(db),u:User=Depends(cur
     q=s.get(Quest,qid); goal=s.get(Goal,q.goal_id) if q else None
     if not q or not goal or goal.user_id!=u.id: raise HTTPException(404,'Quest not found')
     if q.status=='completed': return {'message':'Already completed','earned_xp':0,'earned_coins':0}
+    
+    # Phase 2 Evidence Check: If quest requires tangible evidence proof
+    if q.evidence_required:
+        evs = s.query(Evidence).filter_by(quest_id=q.id, user_id=u.id).all()
+        if not evs:
+            raise HTTPException(400, 'This quest requires evidence submission before completion.')
+        valid_ev = any(e.supports_quest or e.quality >= 60.0 for e in evs)
+        if not valid_ev:
+            raise HTTPException(400, 'Submitted evidence does not sufficiently meet quest criteria. Please review feedback and submit revised deliverables.')
+
     if q.question and x.answer is not None and x.answer!=q.answer: x.score=min(x.score,.4)
     score=max(0,min(1,x.score)); mult=.55+.45*score; earned=round(q.xp*mult); coins=round(q.coin_reward*mult); old,new=add_xp(u,earned); u.coins+=coins; touch(u)
     q.status='completed'; q.completed_at=datetime.utcnow(); s.add(Assessment(quest_id=q.id,user_id=u.id,score=score,attempts=x.attempts,time_taken=x.time_taken,feedback='Strong performance.' if score>=.75 else 'Reinforcement recommended.'))
@@ -777,30 +822,164 @@ def quest_complete(qid:int,x:CompleteIn,s:Session=Depends(db),u:User=Depends(cur
 
 # ---------- Evidence ----------
 @app.post('/api/evidence/{qid}/text')
-def evidence_text(qid:int,value:str,s:Session=Depends(db),u:User=Depends(current_user)):
+async def evidence_text(qid:int,value:str,s:Session=Depends(db),u:User=Depends(current_user)):
     q=s.get(Quest,qid)
     if not q or s.get(Goal,q.goal_id).user_id!=u.id: raise HTTPException(404,'Quest not found')
-    e=Evidence(quest_id=qid,user_id=u.id,kind='text',value=value[:10000],evaluation='Evidence captured. AI review can use this context.',quality=75); s.add(e); s.commit(); return clean(e)
+    eval_res = await evaluate_evidence_with_ai(q.title, q.description or q.title, q.quest_type, 'text', value[:10000])
+    e=Evidence(
+        quest_id=qid,user_id=u.id,kind='text',value=value[:10000],
+        evaluation=eval_res.feedback,
+        quality=round(eval_res.quality * 100, 1),
+        relevance=round(eval_res.relevance, 2),
+        confidence=round(eval_res.confidence, 2),
+        completeness=round(eval_res.completeness, 2),
+        supports_quest=eval_res.supports_quest,
+        feedback=eval_res.feedback,
+        missing_requirements_json=json.dumps(eval_res.missing_requirements)
+    )
+    s.add(e); s.commit()
+    res = clean(e)
+    res['missing_requirements'] = eval_res.missing_requirements
+    return res
 
 @app.post('/api/evidence/{qid}/link')
-def evidence_link(qid:int,value:str,s:Session=Depends(db),u:User=Depends(current_user)):
+async def evidence_link(qid:int,value:str,s:Session=Depends(db),u:User=Depends(current_user)):
     if not re.match(r'^https?://',value): raise HTTPException(400,'Enter a valid http(s) link.')
     q=s.get(Quest,qid)
     if not q or s.get(Goal,q.goal_id).user_id!=u.id: raise HTTPException(404,'Quest not found')
-    e=Evidence(quest_id=qid,user_id=u.id,kind='link',value=value,evaluation='Link captured for review.',quality=80); s.add(e); s.commit(); return clean(e)
+    fetched_text = await safe_fetch_url(value)
+    eval_res = await evaluate_evidence_with_ai(q.title, q.description or q.title, q.quest_type, 'link', f"URL: {value}\n{fetched_text}")
+    e=Evidence(
+        quest_id=qid,user_id=u.id,kind='link',value=value,
+        evaluation=eval_res.feedback,
+        quality=round(eval_res.quality * 100, 1),
+        relevance=round(eval_res.relevance, 2),
+        confidence=round(eval_res.confidence, 2),
+        completeness=round(eval_res.completeness, 2),
+        supports_quest=eval_res.supports_quest,
+        feedback=eval_res.feedback,
+        missing_requirements_json=json.dumps(eval_res.missing_requirements)
+    )
+    s.add(e); s.commit()
+    res = clean(e)
+    res['missing_requirements'] = eval_res.missing_requirements
+    return res
 
 @app.post('/api/evidence/{qid}/file')
 async def evidence_file(qid:int,file:UploadFile=File(...),s:Session=Depends(db),u:User=Depends(current_user)):
     q=s.get(Quest,qid)
     if not q or s.get(Goal,q.goal_id).user_id!=u.id: raise HTTPException(404,'Quest not found')
     safe=re.sub(r'[^A-Za-z0-9_.-]','_',file.filename or 'evidence'); name=f'{u.id}_{qid}_{secrets.token_hex(4)}_{safe}'; path=UPLOAD_DIR/name
-    data=await file.read();
+    data=await file.read()
     if len(data)>8*1024*1024: raise HTTPException(413,'Evidence file must be under 8 MB.')
-    path.write_bytes(data); e=Evidence(quest_id=qid,user_id=u.id,kind='file',value=f'/uploads/{name}',filename=safe,evaluation='File captured for AI review.',quality=80); s.add(e); s.commit(); return clean(e)
+    path.write_bytes(data)
+    extracted_text = extract_text_from_file_data(data, safe)
+    eval_res = await evaluate_evidence_with_ai(q.title, q.description or q.title, q.quest_type, 'file', extracted_text)
+    e=Evidence(
+        quest_id=qid,user_id=u.id,kind='file',value=f'/uploads/{name}',filename=safe,
+        evaluation=eval_res.feedback,
+        quality=round(eval_res.quality * 100, 1),
+        relevance=round(eval_res.relevance, 2),
+        confidence=round(eval_res.confidence, 2),
+        completeness=round(eval_res.completeness, 2),
+        supports_quest=eval_res.supports_quest,
+        feedback=eval_res.feedback,
+        missing_requirements_json=json.dumps(eval_res.missing_requirements)
+    )
+    s.add(e); s.commit()
+    res = clean(e)
+    res['missing_requirements'] = eval_res.missing_requirements
+    return res
+
+class EvaluateEvidenceIn(BaseModel):
+    evidence_id: Optional[int] = None
+    kind: Optional[str] = None
+    value: Optional[str] = None
+
+@app.post('/api/evidence/{qid}/evaluate')
+async def evaluate_evidence_endpoint(qid: int, x: Optional[EvaluateEvidenceIn] = None, s: Session=Depends(db), u: User=Depends(current_user)):
+    q = s.get(Quest, qid)
+    if not q or s.get(Goal, q.goal_id).user_id != u.id:
+        raise HTTPException(404, 'Quest not found')
+    
+    target_ev = None
+    if x and x.evidence_id:
+        target_ev = s.query(Evidence).filter_by(id=x.evidence_id, user_id=u.id, quest_id=qid).first()
+    elif not x or not x.value:
+        target_ev = s.query(Evidence).filter_by(quest_id=qid, user_id=u.id).order_by(Evidence.id.desc()).first()
+    
+    if target_ev:
+        kind = target_ev.kind
+        val = target_ev.value
+    elif x and x.value:
+        kind = x.kind or 'text'
+        val = x.value
+    else:
+        raise HTTPException(400, 'No evidence provided to evaluate')
+        
+    eval_res = await evaluate_evidence_with_ai(q.title, q.description or q.title, q.quest_type, kind, val)
+    if target_ev:
+        target_ev.quality = round(eval_res.quality * 100, 1)
+        target_ev.relevance = round(eval_res.relevance, 2)
+        target_ev.confidence = round(eval_res.confidence, 2)
+        target_ev.completeness = round(eval_res.completeness, 2)
+        target_ev.supports_quest = eval_res.supports_quest
+        target_ev.feedback = eval_res.feedback
+        target_ev.missing_requirements_json = json.dumps(eval_res.missing_requirements)
+        s.commit()
+        
+    return {
+        "relevant": eval_res.relevant,
+        "quality": eval_res.quality,
+        "confidence": eval_res.confidence,
+        "completeness": eval_res.completeness,
+        "feedback": eval_res.feedback,
+        "missing_requirements": eval_res.missing_requirements,
+        "supports_quest": eval_res.supports_quest
+    }
+
+@app.post('/api/evidence/{qid}/github-commit')
+async def evidence_github_commit(qid: int, commit_data: Dict[str, Any], s: Session=Depends(db), u: User=Depends(current_user)):
+    q = s.get(Quest, qid)
+    if not q or s.get(Goal, q.goal_id).user_id != u.id:
+        raise HTTPException(404, 'Quest not found')
+    repo = commit_data.get('repository', 'repo')
+    title = commit_data.get('title', '')
+    desc = commit_data.get('description', '')
+    url = commit_data.get('url', f'https://github.com/{repo}/commit/demo')
+    combined_text = f"GitHub Commit: {title}\nRepo: {repo}\nDescription: {desc}\nURL: {url}"
+    eval_res = await evaluate_evidence_with_ai(q.title, q.description or q.title, q.quest_type, 'github', combined_text)
+    e = Evidence(
+        quest_id=qid,
+        user_id=u.id,
+        kind='github',
+        value=f"{repo}: {title} ({url})",
+        evaluation=eval_res.feedback,
+        quality=round(eval_res.quality * 100, 1),
+        relevance=round(eval_res.relevance, 2),
+        confidence=round(eval_res.confidence, 2),
+        completeness=round(eval_res.completeness, 2),
+        supports_quest=eval_res.supports_quest,
+        feedback=eval_res.feedback,
+        missing_requirements_json=json.dumps(eval_res.missing_requirements)
+    )
+    s.add(e); s.commit()
+    res = clean(e)
+    res['missing_requirements'] = eval_res.missing_requirements
+    return res
 
 @app.get('/api/evidence/{qid}')
 def evidence(qid:int,s:Session=Depends(db),u:User=Depends(current_user)):
-    return [clean(x) for x in s.query(Evidence).filter_by(quest_id=qid,user_id=u.id).order_by(Evidence.id.desc()).all()]
+    rows = s.query(Evidence).filter_by(quest_id=qid,user_id=u.id).order_by(Evidence.id.desc()).all()
+    out = []
+    for x in rows:
+        d = clean(x)
+        try:
+            d['missing_requirements'] = json.loads(x.missing_requirements_json) if x.missing_requirements_json else []
+        except Exception:
+            d['missing_requirements'] = []
+        out.append(d)
+    return out
 
 # ---------- Skills & Trees ----------
 @app.get('/api/skill-tree')
