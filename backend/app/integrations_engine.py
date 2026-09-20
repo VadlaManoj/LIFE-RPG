@@ -1,13 +1,15 @@
 """
-Integrations Engine for LIFE RPG (Phase 2).
+Integrations Engine for LIFE RPG (Phase 2 & Phase 3).
 Handles OAuth architecture, secure token storage (AES-style authenticated keystream),
-activity syncing, deadline extraction, and quest matching for:
-- GitHub
-- Google Calendar
-- Outlook Calendar
-- Fitness Tracker
-Supports both live OAuth workflows and deterministic simulation/demo mode when
-client IDs are not set in the environment.
+token lifecycle & refresh, activity syncing, deadline extraction, Android Health Connect
+bridge ingestion, unified activity normalization, and quest matching for:
+- GitHub (Real OAuth + Repo/Commit Sync)
+- Google Calendar (Real OAuth + Events/Deadlines + Token Refresh)
+- Fitness (Android Health Connect Bridge + Manual Logging)
+- Outlook Calendar (Optional Phase 2 compatibility)
+
+Supports both live OAuth/API workflows and deterministic mock/demo simulation mode
+when provider credentials are not set in the environment.
 """
 
 from __future__ import annotations
@@ -17,7 +19,8 @@ import base64
 import hashlib
 import hmac
 import secrets
-from datetime import datetime, timedelta
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
 import httpx
 from pydantic import BaseModel, Field
@@ -98,6 +101,7 @@ class CalendarEvent(BaseModel):
     is_deadline: bool = False
     suggested_quest_title: Optional[str] = None
     urgency: str = "normal"  # low, normal, urgent
+    remaining_hours: Optional[float] = None
 
 class GitHubActivityItem(BaseModel):
     id: str
@@ -107,19 +111,55 @@ class GitHubActivityItem(BaseModel):
     url: Optional[str] = None
     timestamp: str
     repository: str
+    sha: Optional[str] = None
+    author: Optional[str] = None
 
 class FitnessActivityInput(BaseModel):
     activity_type: str = Field(..., description="e.g. walk, run, cycling, workout, gym")
     duration_minutes: int = Field(..., ge=1, le=1440)
     steps: Optional[int] = Field(None, ge=0)
     calories: Optional[int] = Field(None, ge=0)
+    distance_meters: Optional[float] = Field(None, ge=0)
     date: Optional[str] = Field(None)
     notes: Optional[str] = Field("")
+
+class HealthConnectSession(BaseModel):
+    id: Optional[str] = None
+    title: Optional[str] = "Exercise Session"
+    exercise_type: str = Field(default="workout", description="e.g. walking, running, biking, gym, yoga")
+    start_time: str
+    end_time: str
+    duration_minutes: int = Field(..., ge=1, le=1440)
+    steps: Optional[int] = Field(None, ge=0)
+    calories: Optional[int] = Field(None, ge=0)
+    distance_meters: Optional[float] = Field(None, ge=0)
+    source_app: Optional[str] = "Health Connect"
+
+class HealthConnectSyncBatch(BaseModel):
+    sessions: List[HealthConnectSession] = Field(default_factory=list)
+    daily_steps: Optional[int] = None
+    date: Optional[str] = None
+    device_name: Optional[str] = "Android Device"
+
+class UnifiedActivity(BaseModel):
+    id: str
+    provider: str  # 'GitHub', 'Google Calendar', 'Fitness', 'Health Connect'
+    activity_type: str  # 'github_commit', 'github_repository', 'calendar_event', 'fitness_activity'
+    title: str
+    description: str
+    timestamp: str
+    external_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    matched_quest_id: Optional[int] = None
+    matched_quest_title: Optional[str] = None
 
 # ---------- Provider Implementations ----------
 
 class BaseProvider:
     name: str = "base"
+
+    def is_configured(self) -> bool:
+        return False
 
     def get_auth_url(self, redirect_uri: str, state: str) -> str:
         raise NotImplementedError
@@ -130,6 +170,13 @@ class BaseProvider:
     async def sync(self, access_token: str) -> Dict[str, Any]:
         raise NotImplementedError
 
+    async def refresh_token_if_needed(self, refresh_token: str) -> Optional[Dict[str, Any]]:
+        return None
+
+    async def revoke_token(self, access_token: str) -> bool:
+        return True
+
+
 class GitHubProvider(BaseProvider):
     name = "GitHub"
 
@@ -137,20 +184,30 @@ class GitHubProvider(BaseProvider):
         self.client_id = os.getenv("GITHUB_CLIENT_ID", "")
         self.client_secret = os.getenv("GITHUB_CLIENT_SECRET", "")
 
+    def is_configured(self) -> bool:
+        return bool(self.client_id and self.client_secret)
+
     def get_auth_url(self, redirect_uri: str, state: str) -> str:
-        if not self.client_id:
+        if not self.is_configured():
             # Simulated demo OAuth URL
             return f"/api/integrations/oauth-demo?provider=GitHub&state={state}&redirect_uri={redirect_uri}"
-        return f"https://github.com/login/oauth/authorize?client_id={self.client_id}&redirect_uri={redirect_uri}&scope=repo,read:user&state={state}"
+        # Least privilege scope for repos and user identity
+        return (
+            f"https://github.com/login/oauth/authorize?"
+            f"client_id={self.client_id}&redirect_uri={redirect_uri}&"
+            f"scope=read:user,repo&state={state}"
+        )
 
     async def exchange_code(self, code: str, redirect_uri: str) -> Dict[str, Any]:
-        if not self.client_id or code.startswith("demo_"):
+        if not self.is_configured() or code.startswith("demo_"):
             return {
                 "access_token": f"gho_demo_{secrets.token_hex(16)}",
                 "external_user_id": "hero_developer",
-                "scopes": "repo,read:user",
-                "account_name": "Demo Hero Developer"
+                "scopes": "read:user,repo",
+                "account_name": "Demo Hero Developer",
+                "is_live": False
             }
+
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 "https://github.com/login/oauth/access_token",
@@ -164,24 +221,31 @@ class GitHubProvider(BaseProvider):
             )
             data = resp.json()
             if "error" in data:
-                raise ValueError(data.get("error_description", "GitHub OAuth failed"))
+                raise ValueError(data.get("error_description", f"GitHub OAuth failed: {data.get('error')}"))
 
             token = data.get("access_token")
-            # Fetch user info
+            if not token:
+                raise ValueError("No access token returned by GitHub.")
+
+            # Fetch authenticated user profile
             user_resp = await client.get(
                 "https://api.github.com/user",
-                headers={"Authorization": f"Bearer {token}", "User-Agent": "LIFE-RPG-App"}
+                headers={"Authorization": f"Bearer {token}", "User-Agent": "LIFE-RPG-Platform"}
             )
-            user_info = user_resp.json()
+            user_info = user_resp.json() if user_resp.status_code == 200 else {}
+            login = user_info.get("login") or "github_user"
+            name = user_info.get("name") or login
+
             return {
                 "access_token": token,
-                "external_user_id": str(user_info.get("login", "")),
-                "scopes": data.get("scope", "read:user"),
-                "account_name": user_info.get("name") or user_info.get("login")
+                "external_user_id": str(login),
+                "scopes": data.get("scope", "read:user,repo"),
+                "account_name": name,
+                "is_live": True
             }
 
     async def sync(self, access_token: str) -> Dict[str, Any]:
-        """Fetches repositories and recent commits."""
+        """Fetches live repositories and recent commits using access token."""
         if not access_token or "demo" in access_token:
             now = datetime.now()
             items = [
@@ -192,7 +256,9 @@ class GitHubProvider(BaseProvider):
                     "description": "Added quest completion and quiz verification handlers",
                     "url": "https://github.com/demo/life-rpg-api/commit/9f8c2b",
                     "timestamp": (now - timedelta(hours=2)).isoformat(),
-                    "repository": "life-rpg-api"
+                    "repository": "life-rpg-api",
+                    "sha": "9f8c2b4412ad7e8f",
+                    "author": "Demo Hero"
                 },
                 {
                     "id": "commit_2",
@@ -201,7 +267,9 @@ class GitHubProvider(BaseProvider):
                     "description": "Solved recursion depth bottleneck",
                     "url": "https://github.com/demo/dsa-practice/commit/3a14e9",
                     "timestamp": (now - timedelta(days=1)).isoformat(),
-                    "repository": "dsa-practice"
+                    "repository": "dsa-practice",
+                    "sha": "3a14e9114fbc9a20",
+                    "author": "Demo Hero"
                 },
                 {
                     "id": "repo_1",
@@ -215,35 +283,79 @@ class GitHubProvider(BaseProvider):
             ]
             return {
                 "items": items,
-                "summary": f"{len(items)} recent activities synced (Demo Mode)",
+                "summary": f"{len(items)} recent activities synced (Demo Simulation Mode)",
                 "repositories_count": 2,
-                "last_active_repo": "life-rpg-api"
+                "last_active_repo": "life-rpg-api",
+                "is_live": False
             }
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            headers = {"Authorization": f"Bearer {access_token}", "User-Agent": "LIFE-RPG-App"}
-            # Fetch repos
-            repos_resp = await client.get("https://api.github.com/user/repos?sort=updated&per_page=5", headers=headers)
-            repos = repos_resp.json() if repos_resp.status_code == 200 else []
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            headers = {"Authorization": f"Bearer {access_token}", "User-Agent": "LIFE-RPG-Platform"}
+            # Fetch user repositories
+            repos_resp = await client.get(
+                "https://api.github.com/user/repos?sort=updated&per_page=6&type=owner",
+                headers=headers
+            )
+            if repos_resp.status_code == 401:
+                raise ValueError("GitHub access token expired or revoked. Please reconnect.")
+            if repos_resp.status_code == 403:
+                raise ValueError("GitHub API rate limit exceeded or access forbidden.")
+            if repos_resp.status_code != 200:
+                raise ValueError(f"GitHub API error: HTTP {repos_resp.status_code}")
 
+            repos = repos_resp.json()
             items = []
+
             for r in repos:
+                repo_name = r.get("name", "")
+                owner_login = r.get("owner", {}).get("login", "")
                 items.append({
                     "id": f"repo_{r.get('id')}",
                     "type": "repo",
-                    "title": r.get("name", ""),
-                    "description": r.get("description") or "No description",
+                    "title": repo_name,
+                    "description": r.get("description") or "Repository",
                     "url": r.get("html_url", ""),
                     "timestamp": r.get("updated_at", ""),
-                    "repository": r.get("name", "")
+                    "repository": repo_name
                 })
 
+                # Fetch recent commits for the active repo
+                if owner_login and repo_name and len(items) < 15:
+                    try:
+                        commits_resp = await client.get(
+                            f"https://api.github.com/repos/{owner_login}/{repo_name}/commits?per_page=3",
+                            headers=headers
+                        )
+                        if commits_resp.status_code == 200:
+                            for c in commits_resp.json():
+                                sha = c.get("sha", "")
+                                commit_msg = c.get("commit", {}).get("message", "Commit")
+                                first_line = commit_msg.split("\n")[0][:100]
+                                author_name = c.get("commit", {}).get("author", {}).get("name", "Author")
+                                commit_date = c.get("commit", {}).get("author", {}).get("date", "")
+                                items.append({
+                                    "id": f"commit_{sha[:8]}",
+                                    "type": "commit",
+                                    "title": first_line,
+                                    "description": commit_msg,
+                                    "url": c.get("html_url", ""),
+                                    "timestamp": commit_date,
+                                    "repository": repo_name,
+                                    "sha": sha[:12],
+                                    "author": author_name
+                                })
+                    except Exception:
+                        pass
+
+            last_repo = repos[0].get("name") if repos else "None"
             return {
                 "items": items,
-                "summary": f"Successfully synced {len(items)} repositories from GitHub",
+                "summary": f"Successfully synced {len(items)} items ({len(repos)} repos) from Live GitHub",
                 "repositories_count": len(repos),
-                "last_active_repo": repos[0].get("name") if repos else "None"
+                "last_active_repo": last_repo,
+                "is_live": True
             }
+
 
 class GoogleCalendarProvider(BaseProvider):
     name = "Google Calendar"
@@ -252,24 +364,32 @@ class GoogleCalendarProvider(BaseProvider):
         self.client_id = os.getenv("GOOGLE_CLIENT_ID", "")
         self.client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "")
 
+    def is_configured(self) -> bool:
+        return bool(self.client_id and self.client_secret)
+
     def get_auth_url(self, redirect_uri: str, state: str) -> str:
-        if not self.client_id:
+        if not self.is_configured():
             return f"/api/integrations/oauth-demo?provider=Google+Calendar&state={state}&redirect_uri={redirect_uri}"
         return (
             "https://accounts.google.com/o/oauth2/v2/auth?"
             f"client_id={self.client_id}&redirect_uri={redirect_uri}&response_type=code&"
-            "scope=https://www.googleapis.com/auth/calendar.events.readonly&access_type=offline&prompt=consent&"
+            "scope=https://www.googleapis.com/auth/calendar.events.readonly%20https://www.googleapis.com/auth/userinfo.email&"
+            "access_type=offline&prompt=consent&"
             f"state={state}"
         )
 
     async def exchange_code(self, code: str, redirect_uri: str) -> Dict[str, Any]:
-        if not self.client_id or code.startswith("demo_"):
+        if not self.is_configured() or code.startswith("demo_"):
             return {
                 "access_token": f"ya29_demo_{secrets.token_hex(16)}",
+                "refresh_token": f"1//demo_refresh_{secrets.token_hex(16)}",
                 "external_user_id": "google_hero@gmail.com",
                 "scopes": "calendar.events.readonly",
-                "account_name": "Google Hero"
+                "account_name": "Google Hero",
+                "expires_in": 3600,
+                "is_live": False
             }
+
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 "https://oauth2.googleapis.com/token",
@@ -283,16 +403,55 @@ class GoogleCalendarProvider(BaseProvider):
             )
             data = resp.json()
             if "error" in data:
-                raise ValueError(data.get("error_description", "Google OAuth failed"))
+                raise ValueError(data.get("error_description", f"Google OAuth failed: {data.get('error')}"))
+
+            access_token = data.get("access_token")
+            # Fetch user email
+            user_email = "google_user"
+            try:
+                u_resp = await client.get(
+                    "https://www.googleapis.com/oauth2/v2/userinfo",
+                    headers={"Authorization": f"Bearer {access_token}"}
+                )
+                if u_resp.status_code == 200:
+                    user_email = u_resp.json().get("email", "google_user")
+            except Exception:
+                pass
+
             return {
-                "access_token": data["access_token"],
+                "access_token": access_token,
                 "refresh_token": data.get("refresh_token"),
-                "scopes": data.get("scope", ""),
-                "external_user_id": "google_user"
+                "scopes": data.get("scope", "calendar.events.readonly"),
+                "external_user_id": user_email,
+                "account_name": user_email,
+                "expires_in": data.get("expires_in", 3600),
+                "is_live": True
             }
 
+    async def refresh_token_if_needed(self, refresh_token: str) -> Optional[Dict[str, Any]]:
+        """Refreshes expired access token using refresh_token."""
+        if not self.is_configured() or not refresh_token or refresh_token.startswith("1//demo"):
+            return None
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": self.client_id,
+                    "client_secret": self.client_secret,
+                    "refresh_token": refresh_token,
+                    "grant_type": "refresh_token"
+                }
+            )
+            data = resp.json()
+            if "access_token" in data:
+                return {
+                    "access_token": data["access_token"],
+                    "expires_in": data.get("expires_in", 3600)
+                }
+        return None
+
     async def sync(self, access_token: str) -> Dict[str, Any]:
-        """Fetches calendar events and identifies deadlines within next 14 days."""
+        """Fetches calendar events and identifies deadlines with urgency within next 14 days."""
         now = datetime.now()
         if not access_token or "demo" in access_token:
             events = [
@@ -303,7 +462,8 @@ class GoogleCalendarProvider(BaseProvider):
                     "start_time": (now + timedelta(days=1, hours=4)).replace(minute=0, second=0).isoformat(),
                     "is_deadline": True,
                     "suggested_quest_title": "Submit Project Report & API Code",
-                    "urgency": "urgent"
+                    "urgency": "urgent",
+                    "remaining_hours": 28.0
                 },
                 {
                     "id": "gcal_2",
@@ -312,7 +472,8 @@ class GoogleCalendarProvider(BaseProvider):
                     "start_time": (now + timedelta(days=3, hours=2)).replace(minute=0, second=0).isoformat(),
                     "is_deadline": True,
                     "suggested_quest_title": "Prepare Python & Algorithms Interview",
-                    "urgency": "urgent"
+                    "urgency": "urgent",
+                    "remaining_hours": 74.0
                 },
                 {
                     "id": "gcal_3",
@@ -321,47 +482,86 @@ class GoogleCalendarProvider(BaseProvider):
                     "start_time": (now + timedelta(days=2)).isoformat(),
                     "is_deadline": False,
                     "suggested_quest_title": None,
-                    "urgency": "normal"
+                    "urgency": "normal",
+                    "remaining_hours": 48.0
                 }
             ]
             deadlines = [e for e in events if e["is_deadline"]]
             return {
                 "events": events,
                 "deadlines": deadlines,
-                "summary": f"{len(events)} events synced. {len(deadlines)} active deadlines detected."
+                "summary": f"{len(events)} events synced. {len(deadlines)} active deadlines detected (Demo Mode).",
+                "is_live": False
             }
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=20.0) as client:
             headers = {"Authorization": f"Bearer {access_token}"}
             time_min = now.isoformat() + "Z"
-            time_max = (now + timedelta(days=14)).isoformat() + "Z"
+            time_max = (now + timedelta(days=21)).isoformat() + "Z"
             resp = await client.get(
                 f"https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin={time_min}&timeMax={time_max}&singleEvents=true&orderBy=startTime",
                 headers=headers
             )
-            raw = resp.json() if resp.status_code == 200 else {}
+            if resp.status_code == 401:
+                raise ValueError("Google Calendar access token expired. Re-authentication or refresh required.")
+            if resp.status_code != 200:
+                raise ValueError(f"Google Calendar API returned HTTP {resp.status_code}")
+
+            raw = resp.json()
             events = []
+            deadline_keywords = ["deadline", "submit", "submission", "due", "interview", "exam", "presentation", "report", "deliverable", "milestone", "test", "assignment"]
+
             for item in raw.get("items", []):
                 summary = item.get("summary", "Untitled")
                 start = item.get("start", {}).get("dateTime") or item.get("start", {}).get("date")
-                lower = summary.lower()
-                is_dl = any(k in lower for k in ["deadline", "submit", "submission", "due", "interview", "exam", "presentation", "report"])
-                urgency = "urgent" if is_dl else "normal"
+                desc = item.get("description", "")
+                text_corpus = f"{summary} {desc}".lower()
+
+                is_dl = any(k in text_corpus for k in deadline_keywords)
+
+                # Calculate remaining time
+                rem_hours = None
+                urgency = "normal"
+                if start:
+                    try:
+                        clean_start = start.replace("Z", "+00:00")
+                        ev_time = datetime.fromisoformat(clean_start)
+                        if ev_time.tzinfo is not None:
+                            now_tz = datetime.now(timezone.utc)
+                            diff = (ev_time - now_tz).total_seconds() / 3600.0
+                        else:
+                            diff = (ev_time - now).total_seconds() / 3600.0
+                        rem_hours = round(max(0.0, diff), 1)
+
+                        if is_dl:
+                            if rem_hours <= 48:
+                                urgency = "urgent"
+                            elif rem_hours <= 168: # 7 days
+                                urgency = "high"
+                            else:
+                                urgency = "normal"
+                    except Exception:
+                        pass
+
                 events.append({
                     "id": item.get("id"),
                     "summary": summary,
-                    "description": item.get("description", ""),
+                    "description": desc,
                     "start_time": start,
                     "is_deadline": is_dl,
-                    "suggested_quest_title": f"Prepare for: {summary}" if is_dl else None,
-                    "urgency": urgency
+                    "suggested_quest_title": f"Deliverable: {summary}" if is_dl else None,
+                    "urgency": urgency,
+                    "remaining_hours": rem_hours
                 })
+
             deadlines = [e for e in events if e["is_deadline"]]
             return {
                 "events": events,
                 "deadlines": deadlines,
-                "summary": f"{len(events)} Google Calendar events synced. {len(deadlines)} deadlines detected."
+                "summary": f"{len(events)} Google Calendar events synced. {len(deadlines)} deadlines detected.",
+                "is_live": True
             }
+
 
 class OutlookCalendarProvider(BaseProvider):
     name = "Outlook Calendar"
@@ -370,8 +570,11 @@ class OutlookCalendarProvider(BaseProvider):
         self.client_id = os.getenv("AZURE_CLIENT_ID", "")
         self.client_secret = os.getenv("AZURE_CLIENT_SECRET", "")
 
+    def is_configured(self) -> bool:
+        return bool(self.client_id and self.client_secret)
+
     def get_auth_url(self, redirect_uri: str, state: str) -> str:
-        if not self.client_id:
+        if not self.is_configured():
             return f"/api/integrations/oauth-demo?provider=Outlook+Calendar&state={state}&redirect_uri={redirect_uri}"
         return (
             "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?"
@@ -380,12 +583,13 @@ class OutlookCalendarProvider(BaseProvider):
         )
 
     async def exchange_code(self, code: str, redirect_uri: str) -> Dict[str, Any]:
-        if not self.client_id or code.startswith("demo_"):
+        if not self.is_configured() or code.startswith("demo_"):
             return {
                 "access_token": f"ms_demo_{secrets.token_hex(16)}",
                 "external_user_id": "outlook_hero@outlook.com",
                 "scopes": "Calendars.Read",
-                "account_name": "Outlook Hero"
+                "account_name": "Outlook Hero",
+                "is_live": False
             }
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
@@ -405,7 +609,8 @@ class OutlookCalendarProvider(BaseProvider):
                 "access_token": data["access_token"],
                 "refresh_token": data.get("refresh_token"),
                 "scopes": data.get("scope", ""),
-                "external_user_id": "outlook_user"
+                "external_user_id": "outlook_user",
+                "is_live": True
             }
 
     async def sync(self, access_token: str) -> Dict[str, Any]:
@@ -418,47 +623,238 @@ class OutlookCalendarProvider(BaseProvider):
                 "start_time": (now + timedelta(days=2, hours=6)).replace(minute=0, second=0).isoformat(),
                 "is_deadline": True,
                 "suggested_quest_title": "Final Term Assignment Submission",
-                "urgency": "urgent"
-            },
-            {
-                "id": "ms_cal_2",
-                "summary": "Engineering Sprint Demo",
-                "description": "Demonstrate life rpg features to team",
-                "start_time": (now + timedelta(days=5)).isoformat(),
-                "is_deadline": False,
-                "suggested_quest_title": None,
-                "urgency": "normal"
+                "urgency": "urgent",
+                "remaining_hours": 54.0
             }
         ]
         deadlines = [e for e in events if e["is_deadline"]]
         return {
             "events": events,
             "deadlines": deadlines,
-            "summary": f"{len(events)} Outlook events synced. {len(deadlines)} deadlines found."
+            "summary": f"{len(events)} Outlook events synced. {len(deadlines)} deadlines found.",
+            "is_live": False
         }
+
 
 class FitnessProvider(BaseProvider):
     name = "Fitness"
 
+    def is_configured(self) -> bool:
+        # Health Connect companion bridge is enabled by default
+        return True
+
     async def record_activity(self, activity: FitnessActivityInput) -> Dict[str, Any]:
         """Validates and processes fitness activity into real-world activity log."""
-        earned_xp = min(150, max(15, activity.duration_minutes * 2))
-        earned_coins = min(50, max(5, activity.duration_minutes // 2))
+        # Sanity check activity duration and values
+        duration = min(1440, max(1, activity.duration_minutes))
+        earned_xp = min(150, max(15, duration * 2))
+        earned_coins = min(50, max(5, duration // 2))
 
         return {
-            "activity_type": activity.activity_type,
-            "duration_minutes": activity.duration_minutes,
+            "activity_type": activity.activity_type.lower().strip(),
+            "duration_minutes": duration,
             "steps": activity.steps,
             "calories": activity.calories,
+            "distance_meters": activity.distance_meters,
             "date": activity.date or datetime.now().isoformat(),
             "earned_xp": earned_xp,
             "earned_coins": earned_coins,
             "verified": True,
-            "summary": f"Completed {activity.duration_minutes}m of {activity.activity_type}" + (f" ({activity.steps} steps)" if activity.steps else "")
+            "source": "Manual / Health Connect Bridge",
+            "summary": f"Completed {duration}m of {activity.activity_type}" + (f" ({activity.steps} steps)" if activity.steps else "")
         }
 
+    async def process_health_connect_batch(self, batch: HealthConnectSyncBatch) -> Dict[str, Any]:
+        """
+        Processes real workout sessions and steps synced from Android Health Connect bridge.
+        """
+        processed_sessions = []
+        total_xp = 0
+        total_coins = 0
+
+        for session in batch.sessions:
+            duration = min(1440, max(1, session.duration_minutes))
+            xp = min(150, max(15, duration * 2))
+            coins = min(50, max(5, duration // 2))
+            total_xp += xp
+            total_coins += coins
+
+            summary = f"Health Connect: {duration}m {session.exercise_type}"
+            if session.steps:
+                summary += f", {session.steps} steps"
+            if session.distance_meters:
+                summary += f", {round(session.distance_meters / 1000, 2)} km"
+
+            processed_sessions.append({
+                "id": session.id or f"hc_{secrets.token_hex(6)}",
+                "exercise_type": session.exercise_type.lower(),
+                "title": session.title or f"{session.exercise_type.capitalize()} Workout",
+                "start_time": session.start_time,
+                "end_time": session.end_time,
+                "duration_minutes": duration,
+                "steps": session.steps,
+                "calories": session.calories,
+                "distance_meters": session.distance_meters,
+                "earned_xp": xp,
+                "earned_coins": coins,
+                "source_app": session.source_app or "Health Connect",
+                "summary": summary
+            })
+
+        # Cap total batch reward to prevent abuse
+        total_xp = min(300, total_xp)
+        total_coins = min(100, total_coins)
+
+        return {
+            "sessions": processed_sessions,
+            "daily_steps": batch.daily_steps,
+            "total_xp": total_xp,
+            "total_coins": total_coins,
+            "sessions_count": len(processed_sessions),
+            "summary": f"Successfully ingested {len(processed_sessions)} Health Connect sessions ({batch.daily_steps or 0} daily steps)."
+        }
+
+
+# ---------- Unified Activity Layer ----------
+
+def normalize_activity(
+    provider: str,
+    raw_item: Dict[str, Any]
+) -> UnifiedActivity:
+    """Normalizes provider raw records into standard unified activity format."""
+    now_iso = datetime.now().isoformat()
+    prov_clean = provider.strip()
+
+    if prov_clean == "GitHub":
+        item_type = raw_item.get("type", "commit")
+        sha = raw_item.get("sha", "")
+        repo = raw_item.get("repository", "")
+        title = raw_item.get("title", f"GitHub {item_type}")
+        desc = raw_item.get("description", "")
+        time = raw_item.get("timestamp") or now_iso
+        ext_id = raw_item.get("id") or f"gh_{sha or secrets.token_hex(4)}"
+        return UnifiedActivity(
+            id=f"act_{secrets.token_hex(8)}",
+            provider="GitHub",
+            activity_type="github_commit" if item_type == "commit" else "github_repository",
+            title=title,
+            description=desc,
+            timestamp=time,
+            external_id=ext_id,
+            metadata={"repository": repo, "sha": sha, "url": raw_item.get("url")}
+        )
+
+    elif prov_clean in ("Google Calendar", "Outlook Calendar"):
+        title = raw_item.get("summary", "Calendar Event")
+        desc = raw_item.get("description", "")
+        time = raw_item.get("start_time") or now_iso
+        ext_id = raw_item.get("id") or f"cal_{secrets.token_hex(4)}"
+        is_dl = raw_item.get("is_deadline", False)
+        return UnifiedActivity(
+            id=f"act_{secrets.token_hex(8)}",
+            provider=prov_clean,
+            activity_type="calendar_event",
+            title=title,
+            description=desc,
+            timestamp=time,
+            external_id=ext_id,
+            metadata={
+                "is_deadline": is_dl,
+                "urgency": raw_item.get("urgency", "normal"),
+                "remaining_hours": raw_item.get("remaining_hours")
+            }
+        )
+
+    elif prov_clean in ("Fitness", "Health Connect"):
+        act_type = raw_item.get("activity_type") or raw_item.get("exercise_type") or "workout"
+        dur = raw_item.get("duration_minutes", 30)
+        steps = raw_item.get("steps")
+        title = raw_item.get("title") or f"{dur}m {act_type.capitalize()} Activity"
+        desc = raw_item.get("summary") or f"Completed {dur}m of {act_type}"
+        time = raw_item.get("date") or raw_item.get("start_time") or now_iso
+        ext_id = raw_item.get("id") or f"fit_{secrets.token_hex(4)}"
+        return UnifiedActivity(
+            id=f"act_{secrets.token_hex(8)}",
+            provider="Health Connect",
+            activity_type="fitness_activity",
+            title=title,
+            description=desc,
+            timestamp=time,
+            external_id=ext_id,
+            metadata={"duration_minutes": dur, "steps": steps, "activity_type": act_type}
+        )
+
+    else:
+        return UnifiedActivity(
+            id=f"act_{secrets.token_hex(8)}",
+            provider=prov_clean,
+            activity_type="manual_evidence",
+            title=raw_item.get("title", "Activity"),
+            description=raw_item.get("description", ""),
+            timestamp=now_iso,
+            external_id=secrets.token_hex(6),
+            metadata=raw_item
+        )
+
+
+def match_activity_to_quests(
+    activity: UnifiedActivity,
+    quests: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """
+    Finds the most relevant active quest for a normalized activity.
+    Ensures strict validation (e.g. learning quests cannot be auto-completed by commit alone).
+    """
+    if not quests:
+        return None
+
+    act_type = activity.activity_type
+    act_title_lower = activity.title.lower()
+    act_meta = activity.metadata
+
+    # 1. Fitness matching
+    if act_type == "fitness_activity":
+        fit_kind = str(act_meta.get("activity_type", "")).lower()
+        for q in quests:
+            q_cat = str(q.get("category", "")).lower()
+            q_type = str(q.get("quest_type", "")).lower()
+            q_title = str(q.get("title", "")).lower()
+            if q_cat == "fitness" or q_type == "habit" or fit_kind in q_title or "walk" in q_title or "run" in q_title or "exercise" in q_title:
+                return q
+
+    # 2. GitHub commit / repository matching
+    elif act_type in ("github_commit", "github_repository"):
+        repo = str(act_meta.get("repository", "")).lower()
+        for q in quests:
+            q_title = str(q.get("title", "")).lower()
+            q_desc = str(q.get("description", "")).lower()
+            q_cat = str(q.get("category", "")).lower()
+            q_type = str(q.get("quest_type", "")).lower()
+
+            # Prefer project / build / challenge quests
+            if q_cat in ("coding", "projects") or q_type in ("build", "project", "challenge"):
+                if repo and (repo in q_title or repo in q_desc):
+                    return q
+                if any(w in act_title_lower for w in ["api", "router", "endpoint", "feat", "fix", "crud", "test", "build", "frontend", "backend"]):
+                    return q
+
+        # Fallback to any active coding quest
+        for q in quests:
+            if str(q.get("category", "")).lower() == "coding":
+                return q
+
+    # 3. Calendar deadline matching
+    elif act_type == "calendar_event":
+        for q in quests:
+            q_title = str(q.get("title", "")).lower()
+            if any(w in act_title_lower for w in q_title.split() if len(w) > 3):
+                return q
+
+    return None
+
+
 # Provider Registry
-PROVIDERS = {
+PROVIDERS: Dict[str, BaseProvider] = {
     "GitHub": GitHubProvider(),
     "Google Calendar": GoogleCalendarProvider(),
     "Outlook Calendar": OutlookCalendarProvider(),
@@ -466,8 +862,10 @@ PROVIDERS = {
 }
 
 def get_provider(name: str) -> Optional[BaseProvider]:
-    # Case insensitive lookup
+    """Case-insensitive and whitespace-tolerant provider lookup."""
+    clean_target = name.lower().replace(" ", "").replace("_", "").replace("-", "")
     for key, prov in PROVIDERS.items():
-        if key.lower() == name.lower() or key.lower().replace(" ", "") == name.lower().replace(" ", ""):
+        clean_key = key.lower().replace(" ", "").replace("_", "").replace("-", "")
+        if clean_key == clean_target:
             return prov
     return None
