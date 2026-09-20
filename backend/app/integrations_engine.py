@@ -819,7 +819,10 @@ def match_activity_to_quests(
             q_cat = str(q.get("category", "")).lower()
             q_type = str(q.get("quest_type", "")).lower()
             q_title = str(q.get("title", "")).lower()
-            if q_cat == "fitness" or q_type == "habit" or fit_kind in q_title or "walk" in q_title or "run" in q_title or "exercise" in q_title:
+            # Strict protection: Learning quests, coding quests, or assessment-required quests must NEVER match fitness
+            if q.get("assessment_required") or q_type == "learning" or q_cat in ("learning", "coding", "career"):
+                continue
+            if q_cat in ("fitness", "health", "wellness") or q_type == "habit" or fit_kind in q_title or any(w in q_title for w in ["walk", "run", "workout", "gym", "cardio", "swim", "cycling", "steps"]):
                 return q
 
     # 2. GitHub commit / repository matching
