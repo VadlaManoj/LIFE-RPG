@@ -54,7 +54,257 @@ function Journal(){const [rows,setRows]=useState([]),[form,setForm]=useState({le
 function Weekly(){const [r,setR]=useState(null);useEffect(()=>{request('/weekly-review').then(setR)},[]);if(!r)return <Loading/>;return <div className="page"><PageTitle eyebrow="WEEKLY REVIEW" title={<>Your week, <em>decoded.</em></>} text="The Game Master summarizes the last seven days and sets a focused next-week priority."/><div className="reviewHero"><Sparkles/><div><small>GAME MASTER</small><h2>{r.game_master}</h2><p>{r.next_week}</p></div></div><div className="statGrid"><Stat icon={Zap} label="XP" value={`+${r.xp}`} sub="this week"/><Stat icon={Swords} label="Quests" value={r.quests} sub="assessed"/><Stat icon={Target} label="Average" value={`${r.average}%`} sub="performance"/><Stat icon={Flame} label="Streak" value={r.streak} sub="days"/></div><div className="twoCol"><div className="panel"><small>STRONGEST</small><h2>{r.strongest}</h2><p>Keep using this strength as a bridge into harder quests.</p></div><div className="panel"><small>NEEDS ATTENTION</small><h2>{r.weakest}</h2><p>Give this skill one focused quest next week.</p></div></div></div>}
 function Achievements(){const [rows,setRows]=useState([]);useEffect(()=>{request('/achievements').then(setRows)},[]);return <div className="page"><PageTitle eyebrow="ACHIEVEMENTS" title={<>Make progress <em>visible.</em></>} text="Badges celebrate meaningful milestones without replacing the real-world outcome."/><div className="achievementGrid">{rows.map(a=><div className={`achievement ${a.unlocked?'unlocked':''}`} key={a.id}><div className="achievementIcon">{a.icon}</div><div><h3>{a.title}</h3><p>{a.description}</p></div>{a.unlocked?<Check/>:<Lock/>}</div>)}</div></div>}
 function Social(){const [d,setD]=useState(null),[name,setName]=useState('');const load=()=>request('/social').then(setD);useEffect(()=>{load()},[]);if(!d)return <Loading/>;const add=async()=>{if(name.trim()){await request('/social/friends',{method:'POST',body:JSON.stringify({name})});setName('');load()}};return <div className="page"><PageTitle eyebrow="COMMUNITY" title={<>Accountability without the <em>noise.</em></>} text="Friends, shared challenges and leaderboards sit around the solo campaign rather than replacing it."/><div className="twoCol"><div className="panel"><PanelHead title="Leaderboard" icon={Users}/>{d.leaderboard.map((x,i)=><div className={`leader ${x.you?'you':''}`} key={x.name}><b>#{i+1}</b><span className="miniAvatar">{avatarEmoji(i===0?'mage':'knight')}</span><strong>{x.name}</strong><span>LVL {x.level}</span><b>{x.xp.toLocaleString()} XP</b></div>)}</div><div><div className="panel"><PanelHead title="Weekly challenge" icon={Trophy}/><h3>{d.challenge?.title}</h3><div className="bar"><i style={{width:`${Math.round((d.challenge?.progress||0)/(d.challenge?.target||1)*100)}%`}}/></div><p>{d.challenge?.progress}/{d.challenge?.target} quests · +{d.challenge?.reward} XP</p></div><div className="panel"><h3>Add accountability friend</h3><div className="inline"><input value={name} onChange={e=>setName(e.target.value)} placeholder="Friend name"/><button className="primary" onClick={add}><Plus/></button></div></div></div></div></div>}
-function Integrations(){const [rows,setRows]=useState([]),[syncing,setSyncing]=useState({}),[fitType,setFitType]=useState('walk'),[fitMins,setFitMins]=useState(30),[fitSteps,setFitSteps]=useState(3500),[fitMsg,setFitMsg]=useState('');const load=()=>request('/integrations').then(setRows);useEffect(()=>{load()},[]);const connectProvider=async p=>{try{await request(`/integrations/${p.provider}/callback`,{method:'POST',body:JSON.stringify({code:`demo_${p.provider.toLowerCase().replace(/\s+/g,'_')}_token`})});load()}catch(e){await request('/integrations',{method:'POST',body:JSON.stringify({provider:p.provider,connected:true})});load()}};const disconnectProvider=async p=>{try{await request(`/integrations/${p.provider}/disconnect`,{method:'POST'});load()}catch(e){await request('/integrations',{method:'POST',body:JSON.stringify({provider:p.provider,connected:false})});load()}};const syncProvider=async p=>{setSyncing(s=>({...s,[p.provider]:true}));try{await request(`/integrations/${p.provider}/sync`,{method:'POST'});await load()}catch(e){alert(`Sync error: ${e.message}`)}finally{setSyncing(s=>({...s,[p.provider]:false}))}};const logFitness=async e=>{e.preventDefault();try{const res=await request('/integrations/fitness/activity',{method:'POST',body:JSON.stringify({activity_type:fitType,duration_minutes:+fitMins,steps:+fitSteps})});setFitMsg(`Logged! +${res.earned_xp} XP and +${res.earned_coins} coins awarded.`);setTimeout(()=>setFitMsg(''),5000);load()}catch(err){alert(err.message)}};const getDesc=name=>{if(name==='GitHub')return'Sync commits, repositories, and pull requests to attach code as authentic quest evidence.';if(name.includes('Google Calendar'))return'Detect real-world deadlines, exams, and milestones within 14 days to adjust quest priorities.';if(name.includes('Outlook Calendar'))return'Extract assignment submission windows and meetings directly into your RPG campaign schedule.';if(name==='Fitness')return'Feed real-world physical workouts and daily step goals directly into habit and health quests.';return'Feed focus sessions and real-world milestones into your progress.'};return <div className="page"><PageTitle eyebrow="REAL-WORLD INTEGRATIONS (PHASE 2)" title={<>Connect the RPG to your <em>real world.</em></>} text="Link external activity platforms. The intelligence layer converts real commits, calendar deadlines, and fitness sessions into verified quest progress."/><div className="integrationGrid">{rows.map(x=>{const isConn=!!x.connected;const meta=x.metadata||{};return <div className="intCard panel" key={x.provider}><div className="intTop"><div className="intInfo"><div className="intIconBox">{x.provider==='GitHub'?<GitCommit/>:x.provider.includes('Calendar')?<CalendarDays/>:x.provider==='Fitness'?<Dumbbell/>:<Link2/>}</div><div className="intTitle"><h3>{x.provider}</h3><span className={`intStatusPill ${isConn?'connected':'disconnected'}`}>{isConn?'● CONNECTED':'○ DISCONNECTED'}</span></div></div>{isConn&&<button className="syncBtn" disabled={syncing[x.provider]} onClick={()=>syncProvider(x)}><RefreshCw className={syncing[x.provider]?'spin':''} size={12}/> {syncing[x.provider]?'Syncing…':'Sync Now'}</button>}</div><div className="intDesc">{getDesc(x.provider)}</div>{isConn&&<div className="intMeta"><div><b>Last sync:</b> {x.last_sync_at?new Date(x.last_sync_at).toLocaleString():'Just now'}</div>{meta.summary&&<div style={{marginTop:4,color:'var(--accent)'}}>ℹ️ {meta.summary}</div>}{x.error_message&&<div style={{marginTop:4,color:'var(--danger)'}}>⚠️ {x.error_message}</div>}</div>}{x.provider==='Fitness'&&isConn&&<div className="fitnessQuickLog"><small style={{fontWeight:800,color:'var(--accent)',letterSpacing:'.1em'}}>LOG REAL ACTIVITY</small><form className="fitnessForm" onSubmit={logFitness}><input value={fitType} onChange={e=>setFitType(e.target.value)} placeholder="Activity (e.g. walk, run)"/><input type="number" value={fitMins} onChange={e=>setFitMins(e.target.value)} placeholder="Mins"/><input type="number" value={fitSteps} onChange={e=>setFitSteps(e.target.value)} placeholder="Steps"/><button className="primary" type="submit"><Plus size={13}/> Log</button></form>{fitMsg&&<div className="notice" style={{marginTop:6}}>{fitMsg}</div>}</div>}<div className="intActions" style={{marginTop:16}}>{isConn?<button className="secondary" onClick={()=>disconnectProvider(x)}>Disconnect Provider</button>:<button className="primary" onClick={()=>connectProvider(x)}>Connect {x.provider} <ArrowRight size={14}/></button>}</div></div>})}</div><div className="privacyBlock"><Shield/><div><h3>Zero-Knowledge Security Architecture</h3><p>OAuth tokens are encrypted on the backend with authenticated AES/HMAC keystream cryptography. Access tokens and provider secrets are strictly protected and never exposed to the frontend browser.</p></div></div></div>}
+function Integrations(){
+  const [rows,setRows]=useState([]), [syncing,setSyncing]=useState({}), [activities,setActivities]=useState([]);
+  const [fitType,setFitType]=useState('walk'), [fitMins,setFitMins]=useState(30), [fitSteps,setFitSteps]=useState(3500), [fitMsg,setFitMsg]=useState('');
+  const [bridgeData,setBridgeData]=useState(null), [showBridge,setShowBridge]=useState(false), [copied,setCopied]=useState(false);
+
+  const load=async()=>{
+    try{
+      const data=await request('/integrations');
+      setRows(data);
+      const acts=await request('/integrations/activities').catch(()=>[]);
+      setActivities(acts);
+    }catch(e){}
+  };
+
+  useEffect(()=>{load()},[]);
+
+  const connectProvider=async (p, forceDemo=false)=>{
+    try{
+      if(!forceDemo && p.is_configured){
+        // Fetch real OAuth URL
+        const authData=await request(`/integrations/${p.provider}/auth-url`);
+        if(authData.auth_url && authData.auth_url.startsWith('http')){
+          window.location.href=authData.auth_url;
+          return;
+        }
+      }
+      // Demo / Mock OAuth Flow
+      await request(`/integrations/${p.provider}/callback`,{
+        method:'POST',
+        body:JSON.stringify({code:`demo_${p.provider.toLowerCase().replace(/\s+/g,'_')}_token`,state:`demo_${p.provider.toLowerCase()}`})
+      });
+      await load();
+    }catch(e){
+      try{
+        await request('/integrations',{method:'POST',body:JSON.stringify({provider:p.provider,connected:true})});
+        await load();
+      }catch(err){
+        alert(`Connection error: ${err.message}`);
+      }
+    }
+  };
+
+  const disconnectProvider=async p=>{
+    try{
+      await request(`/integrations/${p.provider}/disconnect`,{method:'POST'});
+      await load();
+    }catch(e){
+      alert(`Disconnect error: ${e.message}`);
+    }
+  };
+
+  const syncProvider=async p=>{
+    setSyncing(s=>({...s,[p.provider]:true}));
+    try{
+      await request(`/integrations/${p.provider}/sync`,{method:'POST'});
+      await load();
+    }catch(e){
+      alert(`Sync error: ${e.message}`);
+    }finally{
+      setSyncing(s=>({...s,[p.provider]:false}));
+    }
+  };
+
+  const loadBridgeToken=async()=>{
+    try{
+      const d=await request('/integrations/fitness/bridge-token');
+      setBridgeData(d);
+      setShowBridge(true);
+    }catch(e){
+      alert(e.message);
+    }
+  };
+
+  const copyToken=()=>{
+    if(bridgeData?.token){
+      navigator.clipboard.writeText(bridgeData.token);
+      setCopied(true);
+      setTimeout(()=>setCopied(false),2500);
+    }
+  };
+
+  const logFitness=async e=>{
+    e.preventDefault();
+    try{
+      const res=await request('/integrations/fitness/activity',{
+        method:'POST',
+        body:JSON.stringify({activity_type:fitType,duration_minutes:+fitMins,steps:+fitSteps})
+      });
+      setFitMsg(`Logged! +${res.earned_xp} XP and +${res.earned_coins} coins awarded.`);
+      setTimeout(()=>setFitMsg(''),5000);
+      load();
+    }catch(err){
+      alert(err.message);
+    }
+  };
+
+  const getDesc=name=>{
+    if(name==='GitHub')return'Sync real repositories and commits to attach verifiable code evidence to engineering quests.';
+    if(name.includes('Google Calendar'))return'Detect real-world deadlines, exams, and deliverables within upcoming weeks to adapt quest priorities.';
+    if(name.includes('Outlook Calendar'))return'Extract assignment submission windows and meetings directly into your RPG schedule.';
+    if(name==='Fitness')return'Connect Android Health Connect companion bridge to ingest verified workouts, steps, and activity.';
+    return'Feed focus sessions and real-world milestones into your progress.';
+  };
+
+  return <div className="page">
+    <PageTitle
+      eyebrow="REAL-WORLD INTEGRATIONS (PHASE 3)"
+      title={<>Connect the RPG to your <em>real world.</em></>}
+      text="Link external providers. The intelligence layer converts real GitHub commits, Google Calendar deadlines, and Android Health Connect workouts into verified RPG quest progress."
+    />
+
+    <div className="integrationGrid">
+      {rows.map(x=>{
+        const isConn=!!x.connected;
+        const isLive=!!x.is_live;
+        const isConfigured=!!x.is_configured;
+        const meta=x.metadata||{};
+        const items=meta.items||[];
+        const events=meta.events||[];
+
+        return <div className="intCard panel" key={x.provider}>
+          <div className="intTop">
+            <div className="intInfo">
+              <div className="intIconBox">
+                {x.provider==='GitHub'?<GitCommit/>:x.provider.includes('Calendar')?<CalendarDays/>:x.provider==='Fitness'?<Dumbbell/>:<Link2/>}
+              </div>
+              <div className="intTitle">
+                <h3>{x.provider}</h3>
+                <div>
+                  <span className={`intStatusPill ${isConn?(isLive?'live':'demo'):'disconnected'}`}>
+                    {isConn?(isLive?'● LIVE CONNECTED':'🧪 DEMO SIMULATION'):'○ DISCONNECTED'}
+                  </span>
+                </div>
+                <div>
+                  <span className={`configBadge ${isConfigured?'ready':'unconfigured'}`}>
+                    {isConfigured?'⚡ Configured for Live OAuth':'🧪 Simulation Mode'}
+                  </span>
+                </div>
+                {x.account_name&&<div className="accountPill">@{x.account_name}</div>}
+              </div>
+            </div>
+            {isConn&&<button className="syncBtn" disabled={syncing[x.provider]} onClick={()=>syncProvider(x)}>
+              <RefreshCw className={syncing[x.provider]?'spin':''} size={12}/> {syncing[x.provider]?'Syncing…':'Sync Now'}
+            </button>}
+          </div>
+
+          <div className="intDesc">{getDesc(x.provider)}</div>
+
+          {isConn&&<div className="intMeta">
+            <div><b>Last sync:</b> {x.last_sync_at?new Date(x.last_sync_at).toLocaleString():'Just now'}</div>
+            {meta.summary&&<div style={{marginTop:4,color:'var(--accent)'}}>ℹ️ {meta.summary}</div>}
+            {x.error_message&&<div style={{marginTop:4,color:'var(--danger)'}}>⚠️ {x.error_message}</div>}
+
+            {/* GitHub synced preview */}
+            {x.provider==='GitHub'&&items.length>0&&<div className="activityMiniList">
+              <h5>Recent Synced Commits & Repos</h5>
+              {items.slice(0,3).map((it,i)=><div className="miniActivityItem" key={i}>
+                <span>{it.type==='commit'?`Commit: ${it.title}`:`Repo: ${it.title}`}</span>
+                <small>{it.repository}</small>
+              </div>)}
+            </div>}
+
+            {/* Google Calendar deadlines preview */}
+            {x.provider.includes('Calendar')&&events.length>0&&<div className="activityMiniList">
+              <h5>Upcoming Events & Deadlines</h5>
+              {events.slice(0,3).map((ev,i)=><div className="miniActivityItem" key={i}>
+                <span>{ev.summary}</span>
+                <span className={`urgencyPill ${ev.urgency||'normal'}`}>{ev.urgency||'normal'}</span>
+              </div>)}
+            </div>}
+          </div>}
+
+          {/* Fitness & Android Health Connect Bridge */}
+          {x.provider==='Fitness'&&<div className="fitnessQuickLog">
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <small style={{fontWeight:800,color:'var(--accent)',letterSpacing:'.1em'}}>ANDROID HEALTH CONNECT</small>
+              <button type="button" style={{fontSize:10,background:'none',border:'none',color:'var(--accent2)',cursor:'pointer',textDecoration:'underline'}} onClick={loadBridgeToken}>
+                {showBridge?'Hide Bridge Pairing':'Pair Android App'}
+              </button>
+            </div>
+
+            {showBridge&&bridgeData&&<div className="bridgeTokenBox">
+              <div className="tokenHeader">
+                <h4><Shield size={12}/> Android Bridge Pairing Token</h4>
+                <small>{bridgeData.device_pair_code}</small>
+              </div>
+              <p style={{fontSize:11,color:'var(--muted)',margin:'0 0 8px'}}>{bridgeData.instructions}</p>
+              <div className="bridgeCodeRow">
+                <code>{bridgeData.token}</code>
+                <button type="button" onClick={copyToken}>{copied?'Copied!':'Copy Token'}</button>
+              </div>
+            </div>}
+
+            {isConn&&<form className="fitnessForm" onSubmit={logFitness}>
+              <input value={fitType} onChange={e=>setFitType(e.target.value)} placeholder="Activity (e.g. walk, run)"/>
+              <input type="number" value={fitMins} onChange={e=>setFitMins(e.target.value)} placeholder="Mins"/>
+              <input type="number" value={fitSteps} onChange={e=>setFitSteps(e.target.value)} placeholder="Steps"/>
+              <button className="primary" type="submit"><Plus size={13}/> Log</button>
+            </form>}
+            {fitMsg&&<div className="notice" style={{marginTop:6}}>{fitMsg}</div>}
+          </div>}
+
+          <div className="intActions" style={{marginTop:16}}>
+            {isConn?(
+              <button className="secondary" onClick={()=>disconnectProvider(x)}>Disconnect Provider</button>
+            ):(
+              <div style={{display:'flex',gap:8,width:'100%'}}>
+                <button className="primary" style={{flex:1}} onClick={()=>connectProvider(x, false)}>
+                  Connect {x.provider} <ArrowRight size={14}/>
+                </button>
+                {x.is_configured&&<button className="secondary" title="Connect in Demo simulation mode" onClick={()=>connectProvider(x, true)}>
+                  Demo
+                </button>}
+              </div>
+            )}
+          </div>
+        </div>
+      })}
+    </div>
+
+    {/* Unified Activity Feed Section */}
+    {activities.length>0&&<div className="feedSection panel">
+      <div className="sectionHead">
+        <div>
+          <small>REAL ACTIVITY STREAM</small>
+          <h2>Unified Activity Feed</h2>
+        </div>
+        <span style={{fontSize:12,color:'var(--muted)'}}>{activities.length} total events ingested</span>
+      </div>
+      <div className="activityFeedGrid">
+        {activities.slice(0,6).map((act,idx)=><div className="feedCard" key={idx}>
+          <div className="feedCardTop">
+            <b>{act.provider} · {act.activity_type.replace('_',' ').toUpperCase()}</b>
+            <small>{new Date(act.timestamp).toLocaleDateString()}</small>
+          </div>
+          <h4>{act.title}</h4>
+          <p>{act.description||'Normalized external activity record.'}</p>
+        </div>)}
+      </div>
+    </div>}
+
+    <div className="privacyBlock">
+      <Shield/>
+      <div>
+        <h3>Zero-Knowledge Security Architecture</h3>
+        <p>OAuth tokens are encrypted on the backend with authenticated AES/HMAC keystream cryptography. Access tokens and provider secrets are strictly protected and never exposed to the frontend browser.</p>
+      </div>
+    </div>
+  </div>;
+}
+
 
 function Notifications(){const [rows,setRows]=useState([]);const load=()=>request('/notifications').then(setRows);useEffect(()=>{load()},[]);const read=async()=>{await request('/notifications/read-all',{method:'POST'});load()};return <div className="page"><PageTitle eyebrow="NOTIFICATIONS" title={<>Your world <em>speaks back.</em></>} text="Campaign events, adaptive recommendations and milestones appear here." action={<button className="secondary" onClick={read}><Check/> Mark all read</button>}/><div className="notificationList">{rows.length?rows.map(n=><div className={`notification panel ${n.read?'read':''}`} key={n.id}><Bell/><div><small>{new Date(n.created_at).toLocaleString()}</small><h3>{n.title}</h3><p>{n.body}</p></div></div>):<EmptyState text="No notifications yet. Your first campaign will create them."/>}</div></div>}
 function SettingsPage({me,refresh}){const [form,setForm]=useState({name:me.name,age_range:me.age_range,timezone:me.timezone,difficulty:me.difficulty,daily_minutes:me.daily_minutes,interests:me.interests,priorities:me.priorities,notifications:me.notifications,theme:me.theme,sound:me.sound});const save=async()=>{await request('/profile',{method:'POST',body:JSON.stringify(form)});refresh();alert('Settings saved.')};const reset=async()=>{if(confirm('Reset your RPG progress?')){await request('/reset',{method:'POST'});location.reload()}};return <div className="page"><PageTitle eyebrow="SETTINGS" title={<>Control your <em>world.</em></>} text="Profile, AI preferences, notifications and privacy controls."/><div className="settingsGrid"><div className="panel"><PanelHead title="Profile" icon={UserRound}/><div className="formGrid"><label>Name<input value={form.name} onChange={e=>setForm({...form,name:e.target.value})}/></label><label>Timezone<input value={form.timezone} onChange={e=>setForm({...form,timezone:e.target.value})}/></label><label>Difficulty<select value={form.difficulty} onChange={e=>setForm({...form,difficulty:e.target.value})}><option>Gentle</option><option>Normal</option><option>Hard</option><option>Elite</option></select></label><label>Daily minutes<input type="number" value={form.daily_minutes} onChange={e=>setForm({...form,daily_minutes:+e.target.value})}/></label><label className="wide">Interests<input value={form.interests} onChange={e=>setForm({...form,interests:e.target.value})}/></label><label className="wide">Priorities<input value={form.priorities} onChange={e=>setForm({...form,priorities:e.target.value})}/></label></div><button className="primary" onClick={save}>Save settings</button></div><div className="panel"><PanelHead title="Privacy & controls" icon={Shield}/><div className="settingToggle"><span><b>Notifications</b><small>Quest reminders and campaign events</small></span><input type="checkbox" checked={form.notifications} onChange={e=>setForm({...form,notifications:e.target.checked})}/></div><div className="settingToggle"><span><b>Sound</b><small>Interface and quest feedback</small></span><input type="checkbox" checked={form.sound} onChange={e=>setForm({...form,sound:e.target.checked})}/></div><div className="danger"><h3>Reset demo progress</h3><p>This clears goals, quests, skills, inventory, journal and social demo data for your account.</p><button onClick={reset}><RefreshCw/> Reset progress</button></div></div></div></div>}

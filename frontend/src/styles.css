@@ -128,3 +128,37 @@
 .syncBtn{padding:8px 12px;background:#182436;border:1px solid #283a54;border-radius:10px;display:flex;align-items:center;gap:6px;font-size:11px;font-weight:700}
 .fitnessQuickLog{margin-top:14px;border-top:1px solid #212f42;padding-top:14px}
 .fitnessForm{display:grid;grid-template-columns:1fr 80px 90px auto;gap:8px;margin-top:8px}
+
+/* Phase 3 Live / Demo Badges & Activity Feed */
+.intStatusPill.live{background:#22c55e22;border:1px solid #22c55e88;color:#4ade80}
+.intStatusPill.demo{background:#eab30822;border:1px solid #eab30866;color:#fde047}
+.configBadge{font-size:9px;font-weight:700;display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:6px;margin-top:4px}
+.configBadge.ready{background:#3b82f61a;border:1px solid #3b82f655;color:#60a5fa}
+.configBadge.unconfigured{background:#64748b1a;border:1px solid #64748b44;color:#94a3b8}
+.accountPill{font-size:10px;font-weight:800;color:#cbd5e1;background:#1e293b;padding:2px 8px;border-radius:6px;border:1px solid #334155;display:inline-block;margin-top:4px}
+.activityMiniList{margin-top:12px;border-top:1px solid #1c2737;padding-top:10px}
+.activityMiniList h5{margin:0 0 6px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.miniActivityItem{padding:5px 8px;background:#0d1522;border-radius:6px;margin-bottom:4px;font-size:11px;color:#e2ecf8;display:flex;justify-content:space-between;align-items:center;border:1px solid #1b2636}
+.miniActivityItem span{max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.miniActivityItem small{color:var(--muted);font-size:9px}
+.urgencyPill{font-size:8px;font-weight:900;padding:2px 6px;border-radius:4px;text-transform:uppercase}
+.urgencyPill.urgent{background:#ef444422;color:#f87171;border:1px solid #ef444466}
+.urgencyPill.high{background:#f59e0b22;color:#fbbf24;border:1px solid #f59e0b66}
+.urgencyPill.normal{background:#10b98122;color:#34d399;border:1px solid #10b98166}
+
+.bridgeTokenBox{margin-top:14px;background:#09101b;border:1px solid #1e2c40;border-radius:12px;padding:12px}
+.bridgeTokenBox .tokenHeader{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.bridgeTokenBox .tokenHeader h4{margin:0;font-size:11px;color:var(--accent2)}
+.bridgeCodeRow{display:flex;gap:8px;align-items:center}
+.bridgeCodeRow code{flex:1;background:#020617;border:1px solid #1e293b;padding:6px 10px;border-radius:6px;font-family:monospace;font-size:11px;color:#38bdf8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bridgeCodeRow button{padding:6px 12px;font-size:10px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#fff;cursor:pointer}
+
+.feedSection{margin-top:32px}
+.activityFeedGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;margin-top:12px}
+.feedCard{background:#0e1520;border:1px solid #1c2838;border-radius:12px;padding:12px}
+.feedCardTop{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.feedCardTop b{font-size:11px;color:var(--accent)}
+.feedCardTop small{font-size:9px;color:var(--muted)}
+.feedCard h4{margin:0 0 4px;font-size:12px;color:#fff;font-weight:600}
+.feedCard p{margin:0;font-size:11px;color:var(--muted);line-height:1.4}
+
