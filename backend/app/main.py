@@ -1203,27 +1203,44 @@ def set_integration(x:IntegrationIn,s:Session=Depends(db),u:User=Depends(current
     return clean_integration(i)
 
 @app.get('/api/integrations/{provider}/auth-url')
-def get_auth_url_endpoint(provider: str, redirect_uri: str = 'http://localhost:5173/integrations', state: Optional[str] = None, u: User=Depends(current_user)):
+def get_auth_url_endpoint(provider: str, redirect_uri: Optional[str] = None, state: Optional[str] = None, u: User=Depends(current_user)):
     prov = get_provider(provider)
     if not prov:
         raise HTTPException(404, f"Provider '{provider}' not supported.")
+    # Environment-configured default redirect URI if none explicitly passed
+    env_redirect = os.getenv(f"{prov.name.upper().replace(' ', '_')}_REDIRECT_URI")
+    effective_redirect = redirect_uri or env_redirect or 'http://localhost:5173/integrations'
     # Whitelist redirect URIs to prevent open-redirect vulnerabilities
     allowed_hosts = ['localhost', '127.0.0.1']
     try:
         from urllib.parse import urlparse
-        parsed = urlparse(redirect_uri)
+        parsed = urlparse(effective_redirect)
         if parsed.hostname not in allowed_hosts and not parsed.hostname.endswith('.life-rpg.internal'):
-            redirect_uri = 'http://localhost:5173/integrations'
+            effective_redirect = 'http://localhost:5173/integrations'
     except Exception:
-        redirect_uri = 'http://localhost:5173/integrations'
+        effective_redirect = 'http://localhost:5173/integrations'
 
-    state_token = state or f"{u.id}_{secrets.token_hex(12)}"
+    prov_slug = prov.name.lower().replace(' ', '_')
+    state_token = state or f"{u.id}_{prov_slug}_{secrets.token_hex(12)}"
     return {
         "provider": prov.name,
-        "auth_url": prov.get_auth_url(redirect_uri, state_token),
+        "auth_url": prov.get_auth_url(effective_redirect, state_token),
         "state": state_token,
         "is_configured": prov.is_configured()
     }
+
+@app.get('/api/integrations/oauth-demo')
+def oauth_demo_redirect(provider: str, state: str = '', redirect_uri: str = 'http://localhost:5173/integrations'):
+    """Simulates real provider OAuth redirect for demo/unconfigured providers."""
+    from fastapi.responses import RedirectResponse
+    from urllib.parse import quote
+    prov = get_provider(provider)
+    prov_name = prov.name if prov else provider
+    prov_slug = prov_name.lower().replace(' ', '_')
+    demo_code = f"demo_{prov_slug}_token_{secrets.token_hex(6)}"
+    sep = '&' if '?' in redirect_uri else '?'
+    target_url = f"{redirect_uri}{sep}code={demo_code}&state={quote(state)}&provider={quote(prov_name)}"
+    return RedirectResponse(url=target_url, status_code=307)
 
 class CallbackIn(BaseModel):
     code: str
@@ -1236,12 +1253,22 @@ async def oauth_callback_endpoint(provider: str, x: CallbackIn, s: Session=Depen
     if not prov:
         raise HTTPException(404, f"Provider '{provider}' not supported.")
     
-    # State ownership check
-    if x.state and not x.state.startswith(f"{u.id}_") and not x.state.startswith("demo_"):
-        raise HTTPException(403, "Invalid OAuth state parameter. Request rejected.")
+    prov_slug = prov.name.lower().replace(' ', '_')
+    # State ownership & provider match check
+    if x.state:
+        if not (x.state.startswith(f"{u.id}_") or x.state.startswith("demo_")):
+            raise HTTPException(403, "Invalid OAuth state parameter. Request rejected.")
+        # If provider slug is encoded in state, verify it matches provider
+        parts = x.state.split('_')
+        if len(parts) >= 3 and parts[0] == str(u.id):
+            state_prov = parts[1].lower()
+            if state_prov != prov_slug and state_prov != prov.name.lower().replace(' ', ''):
+                raise HTTPException(403, f"OAuth state parameter does not match provider '{prov.name}'.")
         
+    env_redirect = os.getenv(f"{prov.name.upper().replace(' ', '_')}_REDIRECT_URI")
+    effective_redirect = x.redirect_uri or env_redirect or 'http://localhost:5173/integrations'
     try:
-        data = await prov.exchange_code(x.code, x.redirect_uri or 'http://localhost:5173/integrations')
+        data = await prov.exchange_code(x.code, effective_redirect)
     except Exception as exc:
         raise HTTPException(400, f"OAuth token exchange failed: {str(exc)}")
         
@@ -1265,7 +1292,7 @@ async def oauth_callback_endpoint(provider: str, x: CallbackIn, s: Session=Depen
     it.error_message = ''
     it.updated_at = datetime.utcnow()
     
-    # Run initial sync automatically
+    # Run initial sync automatically with deduplication
     try:
         token = data.get('access_token', '')
         sync_data = await prov.sync(token)
@@ -1273,23 +1300,25 @@ async def oauth_callback_endpoint(provider: str, x: CallbackIn, s: Session=Depen
         it.sync_status = 'synced'
         it.metadata_json = json.dumps(sync_data)
         
-        # Save activities to unified activity layer
+        # Save activities to unified activity layer with deduplication
         active_quests = [clean(q) for q in s.query(Quest).join(Goal).filter(Goal.user_id==u.id, Quest.status.in_(['available','in_progress'])).all()]
         for item in sync_data.get('items', []) + sync_data.get('events', []):
             norm = normalize_activity(prov.name, item)
-            matched = match_activity_to_quests(norm, active_quests)
-            rec = UnifiedActivityRecord(
-                user_id=u.id,
-                provider=prov.name,
-                activity_type=norm.activity_type,
-                title=norm.title,
-                description=norm.description,
-                external_id=norm.external_id or '',
-                timestamp=norm.timestamp,
-                metadata_json=json.dumps(norm.metadata),
-                matched_quest_id=matched['id'] if matched else None
-            )
-            s.add(rec)
+            existing = s.query(UnifiedActivityRecord).filter_by(user_id=u.id, external_id=norm.external_id).first() if norm.external_id else None
+            if not existing:
+                matched = match_activity_to_quests(norm, active_quests)
+                rec = UnifiedActivityRecord(
+                    user_id=u.id,
+                    provider=prov.name,
+                    activity_type=norm.activity_type,
+                    title=norm.title,
+                    description=norm.description,
+                    external_id=norm.external_id or '',
+                    timestamp=norm.timestamp,
+                    metadata_json=json.dumps(norm.metadata),
+                    matched_quest_id=matched['id'] if matched else None
+                )
+                s.add(rec)
     except Exception as e:
         it.sync_status = 'idle'
         it.error_message = str(e)
@@ -1462,12 +1491,21 @@ async def sync_health_connect_batch(batch: HealthConnectSyncBatch, s: Session=De
     prov = get_provider('Fitness')
     result = await prov.process_health_connect_batch(batch) # type: ignore
     
-    # Save Unified Activity records and match quests
+    # Save Unified Activity records and match quests with deduplication
     active_quests = [clean(q) for q in s.query(Quest).join(Goal).filter(Goal.user_id==u.id, Quest.status.in_(['available','in_progress'])).all()]
     matched_quests_updated = []
+    new_sessions = []
+    new_xp = 0
+    new_coins = 0
     
     for session in result['sessions']:
         norm = normalize_activity("Health Connect", session)
+        existing = s.query(UnifiedActivityRecord).filter_by(user_id=u.id, external_id=norm.external_id).first() if norm.external_id else None
+        if existing:
+            continue
+        new_sessions.append(session)
+        new_xp += session.get('earned_xp', 0)
+        new_coins += session.get('earned_coins', 0)
         matched = match_activity_to_quests(norm, active_quests)
         matched_id = matched['id'] if matched else None
         
@@ -1504,8 +1542,8 @@ async def sync_health_connect_batch(batch: HealthConnectSyncBatch, s: Session=De
                 s.add(e)
                 matched_quests_updated.append(q_obj.title)
 
-    awarded_xp = result['total_xp']
-    awarded_coins = result['total_coins']
+    awarded_xp = min(300, new_xp)
+    awarded_coins = min(100, new_coins)
     old_lvl, new_lvl = add_xp(u, awarded_xp)
     u.coins += awarded_coins
     touch(u)
