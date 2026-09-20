@@ -10,6 +10,54 @@ function App(){
  const [auth,setAuth]=useState(!!localStorage.getItem('liferpg_token')), [me,setMe]=useState(null),[page,setPage]=useState('home'),[dash,setDash]=useState(null),[toast,setToast]=useState(''),[loading,setLoading]=useState(false);
  const load=async()=>{if(!auth)return;try{const u=await request('/me');setMe(u);const d=await request('/dashboard');setDash(d);if(!u.onboarding_done)setPage('onboarding')}catch(e){localStorage.removeItem('liferpg_token');setAuth(false)}};
  useEffect(()=>{load()},[auth]);
+ useEffect(()=>{
+   const params=new URLSearchParams(window.location.search);
+   const code=params.get('code');
+   const state=params.get('state');
+   const error=params.get('error');
+   const errDesc=params.get('error_description');
+   if(error){
+     setToast(`OAuth denied: ${errDesc||error}`);
+     window.history.replaceState({},document.title,window.location.pathname);
+     setPage('integrations');
+     return;
+   }
+   if(code&&state&&auth){
+     const handleOAuthCallback=async()=>{
+       setLoading(true);
+       try{
+         let provider=sessionStorage.getItem('pending_oauth_provider');
+         if(!provider){
+           const parts=state.split('_');
+           if(parts.length>=2){
+             const slug=parts[1].toLowerCase();
+             if(slug.includes('git'))provider='GitHub';
+             else if(slug.includes('google')||slug.includes('cal'))provider='Google Calendar';
+             else if(slug.includes('outlook'))provider='Outlook Calendar';
+           }
+         }
+         if(!provider){
+           provider=params.get('provider')||(code.startsWith('ya29')?'Google Calendar':'GitHub');
+         }
+         const redirectUri=window.location.origin+window.location.pathname;
+         await request(`/integrations/${provider}/callback`,{
+           method:'POST',
+           body:JSON.stringify({code,state,redirect_uri:redirectUri})
+         });
+         sessionStorage.removeItem('pending_oauth_provider');
+         setToast(`🎉 ${provider} successfully connected!`);
+         await load();
+         setPage('integrations');
+       }catch(err){
+         setToast(`OAuth connection error: ${err.message}`);
+       }finally{
+         window.history.replaceState({},document.title,window.location.pathname);
+         setLoading(false);
+       }
+     };
+     handleOAuthCallback();
+   }
+ },[auth]);
  const logout=()=>{localStorage.removeItem('liferpg_token');setAuth(false);setMe(null);setDash(null);setPage('home')};
  if(!auth)return <Auth onLogin={()=>setAuth(true)}/>;
  if(!dash||!me)return <div className="boot"><Gamepad2/><b>Loading your world…</b><span>Syncing your campaign</span></div>;
@@ -73,8 +121,9 @@ function Integrations(){
   const connectProvider=async (p, forceDemo=false)=>{
     try{
       if(!forceDemo && p.is_configured){
-        // Fetch real OAuth URL
-        const authData=await request(`/integrations/${p.provider}/auth-url`);
+        sessionStorage.setItem('pending_oauth_provider', p.provider);
+        const redirectUri=window.location.origin+'/integrations';
+        const authData=await request(`/integrations/${p.provider}/auth-url?redirect_uri=${encodeURIComponent(redirectUri)}`);
         if(authData.auth_url && authData.auth_url.startsWith('http')){
           window.location.href=authData.auth_url;
           return;
@@ -83,7 +132,7 @@ function Integrations(){
       // Demo / Mock OAuth Flow
       await request(`/integrations/${p.provider}/callback`,{
         method:'POST',
-        body:JSON.stringify({code:`demo_${p.provider.toLowerCase().replace(/\s+/g,'_')}_token`,state:`demo_${p.provider.toLowerCase()}`})
+        body:JSON.stringify({code:`demo_${p.provider.toLowerCase().replace(/\s+/g,'_')}_token`,state:`demo_${p.provider.toLowerCase().replace(/\s+/g,'_')}`})
       });
       await load();
     }catch(e){
@@ -183,8 +232,12 @@ function Integrations(){
               <div className="intTitle">
                 <h3>{x.provider}</h3>
                 <div>
-                  <span className={`intStatusPill ${isConn?(isLive?'live':'demo'):'disconnected'}`}>
-                    {isConn?(isLive?'● LIVE CONNECTED':'🧪 DEMO SIMULATION'):'○ DISCONNECTED'}
+                  <span className={`intStatusPill ${x.provider==='Fitness'||x.provider.includes('Health')?(isConn?'connected':'disconnected'):(isConn?(isLive?'live':'demo'):'disconnected')}`}>
+                    {x.provider==='Fitness'||x.provider.includes('Health')
+                      ?(isConn?'● CONNECTED':'○ NOT CONNECTED')
+                      :isConn
+                        ?(isLive?'● LIVE CONNECTED':'🧪 DEMO')
+                        :'○ NOT CONNECTED'}
                   </span>
                 </div>
                 <div>
