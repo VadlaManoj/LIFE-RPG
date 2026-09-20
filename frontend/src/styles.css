@@ -162,3 +162,13 @@
 .feedCard h4{margin:0 0 4px;font-size:12px;color:#fff;font-weight:600}
 .feedCard p{margin:0;font-size:11px;color:var(--muted);line-height:1.4}
 
+.attachedEvidenceList{margin-top:14px;border-top:1px solid #1c2737;padding-top:12px}
+.attachedEvidenceList h4{margin:0 0 8px;font-size:11px;color:var(--accent2);display:flex;align-items:center;gap:6px;text-transform:uppercase;letter-spacing:.08em}
+.evidenceItemCard{background:#0b1320;border:1px solid #1c293c;border-radius:10px;padding:10px;margin-bottom:8px}
+.evidenceItemTop{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
+.evidenceItemTop span{font-size:11px;font-weight:700;display:flex;align-items:center;gap:4px;color:#93c5fd}
+.evidenceValue{font-size:12px;color:#f1f5f9;font-weight:500;word-break:break-all}
+.evidenceFeedback{display:block;margin-top:4px;font-size:11px;color:var(--muted);line-height:1.4}
+.evidenceTime{margin-top:4px;font-size:9px;color:#64748b}
+.evidenceLink{color:#38bdf8;text-decoration:underline;margin-left:6px;font-size:11px}
+
