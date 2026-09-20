@@ -329,6 +329,9 @@ function Integrations(){
           </div>
           <h4>{act.title}</h4>
           <p>{act.description||'Normalized external activity record.'}</p>
+          {act.matched_quest_id&&<div style={{marginTop:6,display:'inline-flex',alignItems:'center',gap:4,fontSize:10,color:'#38bdf8',background:'#0369a122',padding:'2px 7px',borderRadius:4,border:'1px solid #0284c744'}}>
+            <Check size={11}/> Linked as Quest Evidence
+          </div>}
         </div>)}
       </div>
     </div>}
