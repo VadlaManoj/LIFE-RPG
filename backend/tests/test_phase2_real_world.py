@@ -2,6 +2,7 @@ import unittest
 import io
 import json
 from fastapi.testclient import TestClient
+from unittest.mock import patch, MagicMock, AsyncMock
 from app.main import app, SessionLocal, User, Goal, Campaign, Milestone, Quest, Integration, Evidence, hash_password, token_for
 from app.evidence_engine import (
     evaluate_evidence_deterministic, is_safe_url, extract_text_from_file_data,
@@ -204,18 +205,41 @@ Commit hash: 7a8b9c
             self.assertNotIn("access_token", r)
 
     # 6. GitHub Integration Flow & Commit-to-Quest Attachment
-    def test_06_github_integration_and_commit_evidence(self):
+    @patch("httpx.AsyncClient")
+    def test_06_github_integration_and_commit_evidence(self, mock_client_cls):
+        mock_client = AsyncMock()
+        mock_client_cls.return_value.__aenter__.return_value = mock_client
+        mock_post_resp = MagicMock()
+        mock_post_resp.json.return_value = {"access_token": "gho_test_mock_token_123", "scope": "read:user,repo"}
+        mock_client.post.return_value = mock_post_resp
+
+        mock_user_resp = MagicMock()
+        mock_user_resp.status_code = 200
+        mock_user_resp.json.return_value = {"login": "octocat", "name": "The Octocat"}
+
+        mock_repos_resp = MagicMock()
+        mock_repos_resp.status_code = 200
+        mock_repos_resp.json.return_value = [
+            {"id": 101, "name": "life-rpg-api", "description": "Core API", "html_url": "https://github.com/octocat/life-rpg-api", "updated_at": "2026-09-20T10:00:00Z", "owner": {"login": "octocat"}}
+        ]
+        mock_commits_resp = MagicMock()
+        mock_commits_resp.status_code = 200
+        mock_commits_resp.json.return_value = [
+            {"sha": "abcdef123456", "commit": {"message": "feat: implement FastAPI router build", "author": {"name": "Octocat", "date": "2026-09-20T09:30:00Z"}}, "html_url": "https://github.com/octocat/life-rpg-api/commit/abcdef"}
+        ]
+        mock_client.get.side_effect = [mock_user_resp, mock_repos_resp, mock_commits_resp, mock_repos_resp, mock_commits_resp]
+
         # 1. Get Auth URL
         auth_resp = self.client.get("/api/integrations/GitHub/auth-url", headers=self.auth_headers(self.u1_token))
         self.assertEqual(auth_resp.status_code, 200)
         auth_url = auth_resp.json()["auth_url"]
         state = auth_resp.json()["state"]
-        self.assertIn("GitHub", auth_url)
+        self.assertIn("github.com", auth_url.lower())
 
-        # 2. Callback with demo code
+        # 2. Callback with OAuth exchange
         cb_resp = self.client.post(
             "/api/integrations/GitHub/callback",
-            json={"code": "demo_code_123", "state": state},
+            json={"code": "real_mock_code_123", "state": state},
             headers=self.auth_headers(self.u1_token)
         )
         self.assertEqual(cb_resp.status_code, 200)
