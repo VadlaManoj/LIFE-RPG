@@ -27,7 +27,8 @@ from app.nlp_engine import (
     parse_natural_language_goal, NaturalLanguageParseResult
 )
 from app.integrations_engine import (
-    get_provider, PROVIDERS, encrypt_token, decrypt_token, FitnessActivityInput, FitnessProvider
+    get_provider, PROVIDERS, encrypt_token, decrypt_token, FitnessActivityInput, FitnessProvider,
+    HealthConnectSyncBatch, normalize_activity, match_activity_to_quests, UnifiedActivity
 )
 from app.recommendation_engine import (
     generate_personalized_recommendations, RecommendationResponse
@@ -122,6 +123,13 @@ class Integration(Base):
     __tablename__='integrations'
     id=Column(Integer,primary_key=True); user_id=Column(Integer,ForeignKey('users.id')); provider=Column(String); connected=Column(Boolean,default=False)
     status=Column(String,default='disconnected'); external_user_id=Column(String,default=''); scopes=Column(String,default=''); connected_at=Column(DateTime,nullable=True); last_sync_at=Column(DateTime,nullable=True); sync_status=Column(String,default='idle'); error_message=Column(Text,default=''); access_token_enc=Column(Text,default=''); refresh_token_enc=Column(Text,default=''); metadata_json=Column(Text,default='{}'); updated_at=Column(DateTime,default=datetime.utcnow)
+    token_expiry=Column(DateTime,nullable=True); is_live=Column(Boolean,default=False); account_name=Column(String,default='')
+
+class UnifiedActivityRecord(Base):
+    __tablename__='unified_activities'
+    id=Column(Integer,primary_key=True); user_id=Column(Integer,ForeignKey('users.id'),index=True); provider=Column(String); activity_type=Column(String)
+    title=Column(String); description=Column(Text,default=''); external_id=Column(String,default=''); timestamp=Column(String,default='')
+    metadata_json=Column(Text,default='{}'); matched_quest_id=Column(Integer,nullable=True); created_at=Column(DateTime,default=datetime.utcnow)
 
 class Notification(Base):
     __tablename__='notifications'
@@ -170,7 +178,10 @@ def ensure_schema():
             ("error_message", "TEXT DEFAULT ''"),
             ("access_token_enc", "TEXT DEFAULT ''"),
             ("refresh_token_enc", "TEXT DEFAULT ''"),
-            ("metadata_json", "TEXT DEFAULT '{}'")
+            ("metadata_json", "TEXT DEFAULT '{}'"),
+            ("token_expiry", "DATETIME"),
+            ("is_live", "BOOLEAN DEFAULT 0"),
+            ("account_name", "VARCHAR DEFAULT ''")
         ]
         for col_name, col_def in new_int_cols:
             if col_name not in int_cols:
@@ -1153,6 +1164,11 @@ def clean_integration(i: Integration):
     data = clean(i)
     data.pop('access_token_enc', None)
     data.pop('refresh_token_enc', None)
+    prov = get_provider(i.provider)
+    data['is_configured'] = prov.is_configured() if prov else False
+    data['is_live'] = bool(getattr(i, 'is_live', False))
+    data['account_name'] = getattr(i, 'account_name', '') or getattr(i, 'external_user_id', '')
+    data['token_expiry'] = i.token_expiry.isoformat() if getattr(i, 'token_expiry', None) else None
     if 'metadata_json' in data and data['metadata_json']:
         try:
             data['metadata'] = json.loads(data['metadata_json'])
@@ -1180,6 +1196,8 @@ def set_integration(x:IntegrationIn,s:Session=Depends(db),u:User=Depends(current
     if not x.connected:
         i.access_token_enc=''
         i.refresh_token_enc=''
+        i.is_live=False
+        i.account_name=''
     i.updated_at=datetime.utcnow()
     s.commit()
     return clean_integration(i)
@@ -1189,11 +1207,22 @@ def get_auth_url_endpoint(provider: str, redirect_uri: str = 'http://localhost:5
     prov = get_provider(provider)
     if not prov:
         raise HTTPException(404, f"Provider '{provider}' not supported.")
-    state_token = state or f"{u.id}_{secrets.token_hex(8)}"
+    # Whitelist redirect URIs to prevent open-redirect vulnerabilities
+    allowed_hosts = ['localhost', '127.0.0.1']
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(redirect_uri)
+        if parsed.hostname not in allowed_hosts and not parsed.hostname.endswith('.life-rpg.internal'):
+            redirect_uri = 'http://localhost:5173/integrations'
+    except Exception:
+        redirect_uri = 'http://localhost:5173/integrations'
+
+    state_token = state or f"{u.id}_{secrets.token_hex(12)}"
     return {
         "provider": prov.name,
         "auth_url": prov.get_auth_url(redirect_uri, state_token),
-        "state": state_token
+        "state": state_token,
+        "is_configured": prov.is_configured()
     }
 
 class CallbackIn(BaseModel):
@@ -1225,6 +1254,10 @@ async def oauth_callback_endpoint(provider: str, x: CallbackIn, s: Session=Depen
     it.connected_at = datetime.utcnow()
     it.external_user_id = data.get('external_user_id', '')
     it.scopes = data.get('scopes', '')
+    it.is_live = bool(data.get('is_live', False))
+    it.account_name = data.get('account_name', '')
+    if 'expires_in' in data and data['expires_in']:
+        it.token_expiry = datetime.utcnow() + timedelta(seconds=int(data['expires_in']))
     if 'access_token' in data:
         it.access_token_enc = encrypt_token(data['access_token'])
     if 'refresh_token' in data and data['refresh_token']:
@@ -1239,11 +1272,31 @@ async def oauth_callback_endpoint(provider: str, x: CallbackIn, s: Session=Depen
         it.last_sync_at = datetime.utcnow()
         it.sync_status = 'synced'
         it.metadata_json = json.dumps(sync_data)
-    except Exception:
+        
+        # Save activities to unified activity layer
+        active_quests = [clean(q) for q in s.query(Quest).join(Goal).filter(Goal.user_id==u.id, Quest.status.in_(['available','in_progress'])).all()]
+        for item in sync_data.get('items', []) + sync_data.get('events', []):
+            norm = normalize_activity(prov.name, item)
+            matched = match_activity_to_quests(norm, active_quests)
+            rec = UnifiedActivityRecord(
+                user_id=u.id,
+                provider=prov.name,
+                activity_type=norm.activity_type,
+                title=norm.title,
+                description=norm.description,
+                external_id=norm.external_id or '',
+                timestamp=norm.timestamp,
+                metadata_json=json.dumps(norm.metadata),
+                matched_quest_id=matched['id'] if matched else None
+            )
+            s.add(rec)
+    except Exception as e:
         it.sync_status = 'idle'
+        it.error_message = str(e)
         
     s.commit()
-    notify(s, u, f"{prov.name} Connected", f"Successfully linked your {prov.name} account to LIFE RPG.", "integration")
+    mode_label = "Live" if it.is_live else "Demo Simulation"
+    notify(s, u, f"{prov.name} Connected ({mode_label})", f"Successfully linked your {prov.name} account to LIFE RPG.", "integration")
     return clean_integration(it)
 
 @app.post('/api/integrations/{provider}/sync')
@@ -1256,6 +1309,20 @@ async def sync_integration_endpoint(provider: str, s: Session=Depends(db), u: Us
         raise HTTPException(400, f"{provider} is not connected.")
         
     token = decrypt_token(it.access_token_enc) if it.access_token_enc else ""
+    refresh_token = decrypt_token(it.refresh_token_enc) if it.refresh_token_enc else ""
+    
+    # Check if token refresh is supported and needed
+    if refresh_token:
+        try:
+            refreshed = await prov.refresh_token_if_needed(refresh_token)
+            if refreshed and 'access_token' in refreshed:
+                token = refreshed['access_token']
+                it.access_token_enc = encrypt_token(token)
+                if 'expires_in' in refreshed:
+                    it.token_expiry = datetime.utcnow() + timedelta(seconds=int(refreshed['expires_in']))
+        except Exception:
+            pass
+
     try:
         sync_result = await prov.sync(token)
         it.last_sync_at = datetime.utcnow()
@@ -1263,10 +1330,34 @@ async def sync_integration_endpoint(provider: str, s: Session=Depends(db), u: Us
         it.error_message = ''
         it.metadata_json = json.dumps(sync_result)
         it.updated_at = datetime.utcnow()
+        
+        # Ingest into Unified Activity Layer
+        active_quests = [clean(q) for q in s.query(Quest).join(Goal).filter(Goal.user_id==u.id, Quest.status.in_(['available','in_progress'])).all()]
+        raw_items = sync_result.get('items', []) + sync_result.get('events', [])
+        for item in raw_items:
+            norm = normalize_activity(prov.name, item)
+            # Avoid duplicate records with same external_id
+            existing = s.query(UnifiedActivityRecord).filter_by(user_id=u.id, external_id=norm.external_id).first() if norm.external_id else None
+            if not existing:
+                matched = match_activity_to_quests(norm, active_quests)
+                rec = UnifiedActivityRecord(
+                    user_id=u.id,
+                    provider=prov.name,
+                    activity_type=norm.activity_type,
+                    title=norm.title,
+                    description=norm.description,
+                    external_id=norm.external_id or '',
+                    timestamp=norm.timestamp,
+                    metadata_json=json.dumps(norm.metadata),
+                    matched_quest_id=matched['id'] if matched else None
+                )
+                s.add(rec)
+                
         s.commit()
         return {
             "provider": prov.name,
             "status": "synced",
+            "is_live": it.is_live,
             "last_sync_at": it.last_sync_at.isoformat() if it.last_sync_at else None,
             "data": sync_result
         }
@@ -1277,16 +1368,27 @@ async def sync_integration_endpoint(provider: str, s: Session=Depends(db), u: Us
         raise HTTPException(502, f"Sync error: {str(exc)}")
 
 @app.post('/api/integrations/{provider}/disconnect')
-def disconnect_integration_endpoint(provider: str, s: Session=Depends(db), u: User=Depends(current_user)):
+async def disconnect_integration_endpoint(provider: str, s: Session=Depends(db), u: User=Depends(current_user)):
     prov = get_provider(provider)
     prov_name = prov.name if prov else provider
     it = s.query(Integration).filter_by(user_id=u.id, provider=prov_name).first()
     if not it:
         raise HTTPException(404, f"Integration '{provider}' not found.")
+        
+    token = decrypt_token(it.access_token_enc) if it.access_token_enc else ""
+    if prov and token:
+        try:
+            await prov.revoke_token(token)
+        except Exception:
+            pass
+            
     it.connected = False
     it.status = 'disconnected'
+    it.is_live = False
+    it.account_name = ''
     it.access_token_enc = ''
     it.refresh_token_enc = ''
+    it.token_expiry = None
     it.sync_status = 'idle'
     it.metadata_json = '{}'
     it.updated_at = datetime.utcnow()
@@ -1316,9 +1418,121 @@ def get_github_activity(s: Session=Depends(db), u: User=Depends(current_user)):
         return {"connected": bool(it and it.connected), "items": [], "summary": "No GitHub activity recorded."}
     try:
         meta = json.loads(it.metadata_json)
-        return {"connected": True, "items": meta.get("items", []), "summary": meta.get("summary", ""), "last_active_repo": meta.get("last_active_repo")}
+        return {
+            "connected": True,
+            "is_live": it.is_live,
+            "account_name": it.account_name,
+            "items": meta.get("items", []),
+            "summary": meta.get("summary", ""),
+            "last_active_repo": meta.get("last_active_repo")
+        }
     except Exception:
         return {"connected": True, "items": [], "summary": "Error loading activity."}
+
+@app.get('/api/integrations/activities')
+def get_unified_activities(s: Session=Depends(db), u: User=Depends(current_user)):
+    records = s.query(UnifiedActivityRecord).filter_by(user_id=u.id).order_by(UnifiedActivityRecord.id.desc()).limit(50).all()
+    out = []
+    for r in records:
+        d = clean(r)
+        try:
+            d['metadata'] = json.loads(r.metadata_json) if r.metadata_json else {}
+        except Exception:
+            d['metadata'] = {}
+        out.append(d)
+    return out
+
+@app.get('/api/integrations/fitness/bridge-token')
+def get_health_connect_bridge_token(u: User=Depends(current_user)):
+    """Generates pairing token for the Android Health Connect companion bridge."""
+    return {
+        "user_id": u.id,
+        "token": token_for(u.id),
+        "server_url": "http://localhost:8000",
+        "device_pair_code": f"RPG-{u.id}-{secrets.token_hex(3).upper()}",
+        "instructions": "Enter this pairing token in the LIFE RPG Android Health Connect Bridge to securely stream activity summaries."
+    }
+
+@app.post('/api/integrations/fitness/health-connect/sync')
+async def sync_health_connect_batch(batch: HealthConnectSyncBatch, s: Session=Depends(db), u: User=Depends(current_user)):
+    """
+    Ingests exercise sessions and daily steps from the Android Health Connect companion bridge.
+    Normalizes activities, validates against active quests, and awards verified rewards.
+    """
+    prov = get_provider('Fitness')
+    result = await prov.process_health_connect_batch(batch) # type: ignore
+    
+    # Save Unified Activity records and match quests
+    active_quests = [clean(q) for q in s.query(Quest).join(Goal).filter(Goal.user_id==u.id, Quest.status.in_(['available','in_progress'])).all()]
+    matched_quests_updated = []
+    
+    for session in result['sessions']:
+        norm = normalize_activity("Health Connect", session)
+        matched = match_activity_to_quests(norm, active_quests)
+        matched_id = matched['id'] if matched else None
+        
+        rec = UnifiedActivityRecord(
+            user_id=u.id,
+            provider="Health Connect",
+            activity_type="fitness_activity",
+            title=norm.title,
+            description=norm.description,
+            external_id=norm.external_id or '',
+            timestamp=norm.timestamp,
+            metadata_json=json.dumps(norm.metadata),
+            matched_quest_id=matched_id
+        )
+        s.add(rec)
+        
+        # If a matching quest was found, add Evidence
+        if matched:
+            q_obj = s.get(Quest, matched_id)
+            if q_obj:
+                e = Evidence(
+                    quest_id=q_obj.id,
+                    user_id=u.id,
+                    kind='fitness',
+                    value=session['summary'],
+                    evaluation=f"Android Health Connect verified {session['duration_minutes']}m {session['exercise_type']}.",
+                    quality=88.0,
+                    relevance=0.95,
+                    confidence=0.92,
+                    completeness=0.9,
+                    supports_quest=True,
+                    feedback=f"Health Connect recorded: {session['summary']} toward {q_obj.title}."
+                )
+                s.add(e)
+                matched_quests_updated.append(q_obj.title)
+
+    awarded_xp = result['total_xp']
+    awarded_coins = result['total_coins']
+    old_lvl, new_lvl = add_xp(u, awarded_xp)
+    u.coins += awarded_coins
+    touch(u)
+    
+    # Update Fitness integration status
+    it = s.query(Integration).filter_by(user_id=u.id, provider='Fitness').first()
+    if not it:
+        it = Integration(user_id=u.id, provider='Fitness')
+        s.add(it)
+    it.connected = True
+    it.status = 'connected'
+    it.is_live = True
+    it.last_sync_at = datetime.utcnow()
+    it.metadata_json = json.dumps({"latest_batch": result, "summary": result['summary']})
+    
+    notify(s, u, 'Health Connect Sync Complete', result['summary'], 'fitness')
+    s.commit()
+    
+    return {
+        "ok": True,
+        "result": result,
+        "matched_quests": matched_quests_updated,
+        "earned_xp": awarded_xp,
+        "earned_coins": awarded_coins,
+        "level": u.level,
+        "leveled_up": new_lvl > old_lvl
+    }
 
 @app.post('/api/integrations/fitness/activity')
 async def record_fitness_activity(activity: FitnessActivityInput, s: Session=Depends(db), u: User=Depends(current_user)):
@@ -1359,6 +1573,20 @@ async def record_fitness_activity(activity: FitnessActivityInput, s: Session=Dep
         it.last_sync_at = datetime.utcnow()
         it.metadata_json = json.dumps({"latest_activity": result})
         
+    # Also record into Unified Activity
+    norm = normalize_activity("Fitness", result)
+    s.add(UnifiedActivityRecord(
+        user_id=u.id,
+        provider="Fitness",
+        activity_type="fitness_activity",
+        title=norm.title,
+        description=norm.description,
+        external_id=norm.external_id or '',
+        timestamp=norm.timestamp,
+        metadata_json=json.dumps(norm.metadata),
+        matched_quest_id=habit_q.id if habit_q else None
+    ))
+    
     notify(s, u, 'Fitness Activity Recorded', result['summary'], 'fitness')
     s.commit()
     return {
