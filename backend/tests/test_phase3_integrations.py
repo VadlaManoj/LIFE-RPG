@@ -502,5 +502,105 @@ class Phase3IntegrationTests(unittest.TestCase):
         self.assertEqual(hc_resp.status_code, 200)
         self.assertGreater(hc_resp.json()["earned_xp"], 0)
 
+    # =========================================================================
+    # 7. Additional Phase 3 Edge Cases & Security Checks
+    # =========================================================================
+    def test_12_oauth_state_cross_provider_rejection(self):
+        """State generated for GitHub must be rejected when sent to Google Calendar."""
+        github_state = f"{self.u1.id}_github_abc123"
+        resp = self.client.post(
+            "/api/integrations/Google Calendar/callback",
+            json={"code": "some_code", "state": github_state},
+            headers=self.auth_headers(self.u1_token)
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertIn("OAuth state parameter does not match provider", resp.json()["detail"])
+
+    def test_13_oauth_demo_redirect_endpoint(self):
+        """Verify the /api/integrations/oauth-demo redirect endpoint generates simulated demo code and redirects."""
+        resp = self.client.get(
+            "/api/integrations/oauth-demo?provider=GitHub&state=1_github_test&redirect_uri=http://localhost:5173/integrations",
+            follow_redirects=False
+        )
+        self.assertIn(resp.status_code, (302, 307))
+        location = resp.headers.get("location", "")
+        self.assertIn("code=demo_github_token", location)
+        self.assertIn("state=1_github_test", location)
+        self.assertIn("provider=GitHub", location)
+
+    def test_14_health_connect_deduplication(self):
+        """Posting duplicate Health Connect batches must NOT duplicate activities or double-award XP."""
+        now = datetime.now()
+        dup_session_id = "hc_dup_session_999"
+        batch = {
+            "sessions": [{
+                "id": dup_session_id,
+                "title": "Evening Jog",
+                "exercise_type": "running",
+                "start_time": (now - timedelta(minutes=25)).isoformat(),
+                "end_time": now.isoformat(),
+                "duration_minutes": 25,
+                "steps": 3100
+            }]
+        }
+        # First ingestion
+        r1 = self.client.post(
+            "/api/integrations/fitness/health-connect/sync",
+            json=batch,
+            headers=self.auth_headers(self.u1_token)
+        )
+        self.assertEqual(r1.status_code, 200)
+        xp1 = r1.json()["earned_xp"]
+        self.assertGreater(xp1, 0)
+
+        # Second ingestion with the same session id
+        r2 = self.client.post(
+            "/api/integrations/fitness/health-connect/sync",
+            json=batch,
+            headers=self.auth_headers(self.u1_token)
+        )
+        self.assertEqual(r2.status_code, 200)
+        # Deduplication must award 0 additional XP
+        self.assertEqual(r2.json()["earned_xp"], 0)
+
+    def test_15_fitness_activity_strictly_ignores_learning_quests(self):
+        """Fitness activity must never match a coding or learning quest even if it contains words like 'exercise'."""
+        g_learn = Goal(user_id=self.u1.id, title="Algorithms Mastery", category="Learning", goal_type="learning")
+        self.db.add(g_learn)
+        self.db.commit()
+
+        q_code = Quest(
+            goal_id=g_learn.id,
+            title="Tree Traversal Exercise 1",
+            description="Complete binary tree exercise",
+            quest_type="learning",
+            category="Coding",
+            assessment_required=True,
+            status="available"
+        )
+        self.db.add(q_code)
+        self.db.commit()
+
+        # Ingest fitness activity
+        now = datetime.now()
+        batch = {
+            "sessions": [{
+                "id": "hc_fit_exercise_01",
+                "title": "Gym Exercise Routine",
+                "exercise_type": "workout",
+                "start_time": (now - timedelta(minutes=45)).isoformat(),
+                "end_time": now.isoformat(),
+                "duration_minutes": 45
+            }]
+        }
+        r = self.client.post(
+            "/api/integrations/fitness/health-connect/sync",
+            json=batch,
+            headers=self.auth_headers(self.u1_token)
+        )
+        self.assertEqual(r.status_code, 200)
+        # Verify the coding quest was NOT matched
+        self.assertNotIn("Tree Traversal Exercise 1", r.json()["matched_quests"])
+
 if __name__ == "__main__":
     unittest.main()

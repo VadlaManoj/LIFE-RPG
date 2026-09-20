@@ -1258,12 +1258,20 @@ async def oauth_callback_endpoint(provider: str, x: CallbackIn, s: Session=Depen
     if x.state:
         if not (x.state.startswith(f"{u.id}_") or x.state.startswith("demo_")):
             raise HTTPException(403, "Invalid OAuth state parameter. Request rejected.")
-        # If provider slug is encoded in state, verify it matches provider
-        parts = x.state.split('_')
-        if len(parts) >= 3 and parts[0] == str(u.id):
-            state_prov = parts[1].lower()
-            if state_prov != prov_slug and state_prov != prov.name.lower().replace(' ', ''):
-                raise HTTPException(403, f"OAuth state parameter does not match provider '{prov.name}'.")
+        # Reject cross-provider state tampering if state specifically contains another known provider's tag
+        known_other_slugs = {
+            'github': 'GitHub',
+            'google_calendar': 'Google Calendar',
+            'googlecalendar': 'Google Calendar',
+            'outlook_calendar': 'Outlook Calendar',
+            'outlookcalendar': 'Outlook Calendar'
+        }
+        current_clean = prov.name.lower().replace(' ', '').replace('_', '')
+        for other_slug, other_name in known_other_slugs.items():
+            other_clean = other_name.lower().replace(' ', '').replace('_', '')
+            if other_clean != current_clean:
+                if f"_{other_slug}_" in f"_{x.state}_" or f"_{other_clean}_" in f"_{x.state}_":
+                    raise HTTPException(403, f"OAuth state parameter does not match provider '{prov.name}'.")
         
     env_redirect = os.getenv(f"{prov.name.upper().replace(' ', '_')}_REDIRECT_URI")
     effective_redirect = x.redirect_uri or env_redirect or 'http://localhost:5173/integrations'
