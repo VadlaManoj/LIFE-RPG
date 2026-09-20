@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 import os, json, re, hmac, hashlib, base64, secrets, httpx
 
+# Load .env FIRST before importing any app modules that read os.getenv() at module level.
+_BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(dotenv_path=_BASE_DIR / ".env", override=True)
+
 from app.goal_engine import (
     GoalAnalysisResult, analyze_goal_deterministic, detect_learning_subject,
     get_curriculum_for_subject
@@ -34,7 +38,6 @@ from app.recommendation_engine import (
     generate_personalized_recommendations, RecommendationResponse
 )
 
-load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_URL = f"sqlite:///{BASE_DIR / 'liferpg_final.db'}"
 UPLOAD_DIR = BASE_DIR / 'uploads'
@@ -1222,25 +1225,19 @@ def get_auth_url_endpoint(provider: str, redirect_uri: Optional[str] = None, sta
 
     prov_slug = prov.name.lower().replace(' ', '_')
     state_token = state or f"{u.id}_{prov_slug}_{secrets.token_hex(12)}"
+    if not prov.is_configured():
+        raise HTTPException(400, f"{prov.name} OAuth credentials are not configured on this server. Add {prov.name.upper().replace(' ', '_')}_CLIENT_ID and _CLIENT_SECRET to your backend .env file.")
+    try:
+        auth_url = prov.get_auth_url(effective_redirect, state_token)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return {
         "provider": prov.name,
-        "auth_url": prov.get_auth_url(effective_redirect, state_token),
+        "auth_url": auth_url,
         "state": state_token,
-        "is_configured": prov.is_configured()
+        "is_configured": True
     }
 
-@app.get('/api/integrations/oauth-demo')
-def oauth_demo_redirect(provider: str, state: str = '', redirect_uri: str = 'http://localhost:5173/integrations'):
-    """Simulates real provider OAuth redirect for demo/unconfigured providers."""
-    from fastapi.responses import RedirectResponse
-    from urllib.parse import quote
-    prov = get_provider(provider)
-    prov_name = prov.name if prov else provider
-    prov_slug = prov_name.lower().replace(' ', '_')
-    demo_code = f"demo_{prov_slug}_token_{secrets.token_hex(6)}"
-    sep = '&' if '?' in redirect_uri else '?'
-    target_url = f"{redirect_uri}{sep}code={demo_code}&state={quote(state)}&provider={quote(prov_name)}"
-    return RedirectResponse(url=target_url, status_code=307)
 
 class CallbackIn(BaseModel):
     code: str
@@ -1256,7 +1253,7 @@ async def oauth_callback_endpoint(provider: str, x: CallbackIn, s: Session=Depen
     prov_slug = prov.name.lower().replace(' ', '_')
     # State ownership & provider match check
     if x.state:
-        if not (x.state.startswith(f"{u.id}_") or x.state.startswith("demo_")):
+        if not x.state.startswith(f"{u.id}_"):
             raise HTTPException(403, "Invalid OAuth state parameter. Request rejected.")
         # Reject cross-provider state tampering if state specifically contains another known provider's tag
         known_other_slugs = {

@@ -118,30 +118,24 @@ function Integrations(){
 
   useEffect(()=>{load()},[]);
 
-  const connectProvider=async (p, forceDemo=false)=>{
+  const connectProvider=async (p)=>{
+    if(!p.is_configured){
+      alert(`${p.provider} is not configured on this server.\n\nAdd ${p.provider.toUpperCase().replace(/ /g,'_')}_CLIENT_ID and ${p.provider.toUpperCase().replace(/ /g,'_')}_CLIENT_SECRET to your backend .env file, then restart the server.`);
+      return;
+    }
     try{
-      if(!forceDemo && p.is_configured){
-        sessionStorage.setItem('pending_oauth_provider', p.provider);
-        const redirectUri=window.location.origin+'/integrations';
-        const authData=await request(`/integrations/${p.provider}/auth-url?redirect_uri=${encodeURIComponent(redirectUri)}`);
-        if(authData.auth_url && authData.auth_url.startsWith('http')){
-          window.location.href=authData.auth_url;
-          return;
-        }
+      sessionStorage.setItem('pending_oauth_provider', p.provider);
+      const redirectUri=window.location.origin+'/integrations';
+      const authData=await request(`/integrations/${p.provider}/auth-url?redirect_uri=${encodeURIComponent(redirectUri)}`);
+      if(!authData.auth_url||!authData.auth_url.startsWith('http')){
+        alert(`${p.provider} returned an invalid auth URL. Check your OAuth credentials in the backend .env.`);
+        sessionStorage.removeItem('pending_oauth_provider');
+        return;
       }
-      // Demo / Mock OAuth Flow
-      await request(`/integrations/${p.provider}/callback`,{
-        method:'POST',
-        body:JSON.stringify({code:`demo_${p.provider.toLowerCase().replace(/\s+/g,'_')}_token`,state:`demo_${p.provider.toLowerCase().replace(/\s+/g,'_')}`})
-      });
-      await load();
+      window.location.href=authData.auth_url;
     }catch(e){
-      try{
-        await request('/integrations',{method:'POST',body:JSON.stringify({provider:p.provider,connected:true})});
-        await load();
-      }catch(err){
-        alert(`Connection error: ${err.message}`);
-      }
+      sessionStorage.removeItem('pending_oauth_provider');
+      alert(`OAuth error: ${e.message}`);
     }
   };
 
@@ -232,17 +226,13 @@ function Integrations(){
               <div className="intTitle">
                 <h3>{x.provider}</h3>
                 <div>
-                  <span className={`intStatusPill ${x.provider==='Fitness'||x.provider.includes('Health')?(isConn?'connected':'disconnected'):(isConn?(isLive?'live':'demo'):'disconnected')}`}>
-                    {x.provider==='Fitness'||x.provider.includes('Health')
-                      ?(isConn?'● CONNECTED':'○ NOT CONNECTED')
-                      :isConn
-                        ?(isLive?'● LIVE CONNECTED':'🧪 DEMO')
-                        :'○ NOT CONNECTED'}
+                  <span className={`intStatusPill ${isConn?'live':'disconnected'}`}>
+                    {isConn?'● LIVE CONNECTED':'○ NOT CONNECTED'}
                   </span>
                 </div>
                 <div>
                   <span className={`configBadge ${isConfigured?'ready':'unconfigured'}`}>
-                    {isConfigured?'⚡ Configured for Live OAuth':'🧪 Simulation Mode'}
+                    {isConfigured?'⚡ Live OAuth Ready':'⚠️ Not Configured'}
                   </span>
                 </div>
                 {x.account_name&&<div className="accountPill">@{x.account_name}</div>}
@@ -313,14 +303,9 @@ function Integrations(){
             {isConn?(
               <button className="secondary" onClick={()=>disconnectProvider(x)}>Disconnect Provider</button>
             ):(
-              <div style={{display:'flex',gap:8,width:'100%'}}>
-                <button className="primary" style={{flex:1}} onClick={()=>connectProvider(x, false)}>
-                  Connect {x.provider} <ArrowRight size={14}/>
-                </button>
-                {x.is_configured&&<button className="secondary" title="Connect in Demo simulation mode" onClick={()=>connectProvider(x, true)}>
-                  Demo
-                </button>}
-              </div>
+              <button className="primary" style={{width:'100%'}} onClick={()=>connectProvider(x)}>
+                {isConfigured?`Connect ${x.provider}`:`Configure ${x.provider} First`} <ArrowRight size={14}/>
+              </button>
             )}
           </div>
         </div>

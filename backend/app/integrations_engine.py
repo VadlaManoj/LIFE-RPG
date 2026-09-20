@@ -7,9 +7,6 @@ bridge ingestion, unified activity normalization, and quest matching for:
 - Google Calendar (Real OAuth + Events/Deadlines + Token Refresh)
 - Fitness (Android Health Connect Bridge + Manual Logging)
 - Outlook Calendar (Optional Phase 2 compatibility)
-
-Supports both live OAuth/API workflows and deterministic mock/demo simulation mode
-when provider credentials are not set in the environment.
 """
 
 from __future__ import annotations
@@ -22,8 +19,15 @@ import secrets
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
+from pathlib import Path
 import httpx
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+# Load .env before reading any environment variables.
+# Use the absolute path to backend/.env so this works regardless of working directory.
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=_ENV_FILE, override=True)
 
 SECRET = os.getenv("LIFE_RPG_SECRET", "change-this-secret-in-production")
 
@@ -177,44 +181,36 @@ class BaseProvider:
         return True
 
 
+
 class GitHubProvider(BaseProvider):
     name = "GitHub"
 
-    def __init__(self):
-        self.client_id = os.getenv("GITHUB_CLIENT_ID", "")
-        self.client_secret = os.getenv("GITHUB_CLIENT_SECRET", "")
-
     def is_configured(self) -> bool:
-        return bool(self.client_id and self.client_secret)
+        return bool(os.getenv("GITHUB_CLIENT_ID") and os.getenv("GITHUB_CLIENT_SECRET"))
 
     def get_auth_url(self, redirect_uri: str, state: str) -> str:
+        client_id = os.getenv("GITHUB_CLIENT_ID", "")
         if not self.is_configured():
-            # Simulated demo OAuth URL
-            return f"/api/integrations/oauth-demo?provider=GitHub&state={state}&redirect_uri={redirect_uri}"
-        # Least privilege scope for repos and user identity
+            raise ValueError("GitHub OAuth credentials (GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET) are not configured on this server.")
         return (
             f"https://github.com/login/oauth/authorize?"
-            f"client_id={self.client_id}&redirect_uri={redirect_uri}&"
+            f"client_id={client_id}&redirect_uri={redirect_uri}&"
             f"scope=read:user,repo&state={state}"
         )
 
     async def exchange_code(self, code: str, redirect_uri: str) -> Dict[str, Any]:
-        if not self.is_configured() or code.startswith("demo_"):
-            return {
-                "access_token": f"gho_demo_{secrets.token_hex(16)}",
-                "external_user_id": "hero_developer",
-                "scopes": "read:user,repo",
-                "account_name": "Demo Hero Developer",
-                "is_live": False
-            }
+        client_id = os.getenv("GITHUB_CLIENT_ID", "")
+        client_secret = os.getenv("GITHUB_CLIENT_SECRET", "")
+        if not (client_id and client_secret):
+            raise ValueError("GitHub OAuth credentials are not configured on this server.")
 
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 "https://github.com/login/oauth/access_token",
                 headers={"Accept": "application/json"},
                 data={
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
                     "code": code,
                     "redirect_uri": redirect_uri
                 }
@@ -244,50 +240,11 @@ class GitHubProvider(BaseProvider):
                 "is_live": True
             }
 
+
     async def sync(self, access_token: str) -> Dict[str, Any]:
         """Fetches live repositories and recent commits using access token."""
-        if not access_token or "demo" in access_token:
-            now = datetime.now()
-            items = [
-                {
-                    "id": "commit_1",
-                    "type": "commit",
-                    "title": "feat: implement FastAPI router and async endpoints",
-                    "description": "Added quest completion and quiz verification handlers",
-                    "url": "https://github.com/demo/life-rpg-api/commit/9f8c2b",
-                    "timestamp": (now - timedelta(hours=2)).isoformat(),
-                    "repository": "life-rpg-api",
-                    "sha": "9f8c2b4412ad7e8f",
-                    "author": "Demo Hero"
-                },
-                {
-                    "id": "commit_2",
-                    "type": "commit",
-                    "title": "refactor: optimize binary search tree traversal",
-                    "description": "Solved recursion depth bottleneck",
-                    "url": "https://github.com/demo/dsa-practice/commit/3a14e9",
-                    "timestamp": (now - timedelta(days=1)).isoformat(),
-                    "repository": "dsa-practice",
-                    "sha": "3a14e9114fbc9a20",
-                    "author": "Demo Hero"
-                },
-                {
-                    "id": "repo_1",
-                    "type": "repo",
-                    "title": "life-rpg-api",
-                    "description": "Python + FastAPI RPG game engine with evidence evaluator",
-                    "url": "https://github.com/demo/life-rpg-api",
-                    "timestamp": now.isoformat(),
-                    "repository": "life-rpg-api"
-                }
-            ]
-            return {
-                "items": items,
-                "summary": f"{len(items)} recent activities synced (Demo Simulation Mode)",
-                "repositories_count": 2,
-                "last_active_repo": "life-rpg-api",
-                "is_live": False
-            }
+        if not access_token:
+            raise ValueError("GitHub access token is missing or invalid. Please connect your GitHub account via OAuth.")
 
         async with httpx.AsyncClient(timeout=20.0) as client:
             headers = {"Authorization": f"Bearer {access_token}", "User-Agent": "LIFE-RPG-Platform"}
@@ -360,42 +317,33 @@ class GitHubProvider(BaseProvider):
 class GoogleCalendarProvider(BaseProvider):
     name = "Google Calendar"
 
-    def __init__(self):
-        self.client_id = os.getenv("GOOGLE_CLIENT_ID", "")
-        self.client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "")
-
     def is_configured(self) -> bool:
-        return bool(self.client_id and self.client_secret)
+        return bool(os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET"))
 
     def get_auth_url(self, redirect_uri: str, state: str) -> str:
+        client_id = os.getenv("GOOGLE_CLIENT_ID", "")
         if not self.is_configured():
-            return f"/api/integrations/oauth-demo?provider=Google+Calendar&state={state}&redirect_uri={redirect_uri}"
+            raise ValueError("Google Calendar OAuth credentials (GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET) are not configured on this server.")
         return (
             "https://accounts.google.com/o/oauth2/v2/auth?"
-            f"client_id={self.client_id}&redirect_uri={redirect_uri}&response_type=code&"
+            f"client_id={client_id}&redirect_uri={redirect_uri}&response_type=code&"
             "scope=https://www.googleapis.com/auth/calendar.events.readonly%20https://www.googleapis.com/auth/userinfo.email&"
             "access_type=offline&prompt=consent&"
             f"state={state}"
         )
 
     async def exchange_code(self, code: str, redirect_uri: str) -> Dict[str, Any]:
-        if not self.is_configured() or code.startswith("demo_"):
-            return {
-                "access_token": f"ya29_demo_{secrets.token_hex(16)}",
-                "refresh_token": f"1//demo_refresh_{secrets.token_hex(16)}",
-                "external_user_id": "google_hero@gmail.com",
-                "scopes": "calendar.events.readonly",
-                "account_name": "Google Hero",
-                "expires_in": 3600,
-                "is_live": False
-            }
+        client_id = os.getenv("GOOGLE_CLIENT_ID", "")
+        client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "")
+        if not (client_id and client_secret):
+            raise ValueError("Google Calendar OAuth credentials are not configured on this server.")
 
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 "https://oauth2.googleapis.com/token",
                 data={
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
                     "code": code,
                     "grant_type": "authorization_code",
                     "redirect_uri": redirect_uri
@@ -430,14 +378,16 @@ class GoogleCalendarProvider(BaseProvider):
 
     async def refresh_token_if_needed(self, refresh_token: str) -> Optional[Dict[str, Any]]:
         """Refreshes expired access token using refresh_token."""
-        if not self.is_configured() or not refresh_token or refresh_token.startswith("1//demo"):
+        if not self.is_configured() or not refresh_token:
             return None
+        client_id = os.getenv("GOOGLE_CLIENT_ID", "")
+        client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "")
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 "https://oauth2.googleapis.com/token",
                 data={
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
                     "refresh_token": refresh_token,
                     "grant_type": "refresh_token"
                 }
