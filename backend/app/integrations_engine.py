@@ -778,23 +778,59 @@ def match_activity_to_quests(
     # 2. GitHub commit / repository matching
     elif act_type in ("github_commit", "github_repository"):
         repo = str(act_meta.get("repository", "")).lower()
-        for q in quests:
-            q_title = str(q.get("title", "")).lower()
-            q_desc = str(q.get("description", "")).lower()
-            q_cat = str(q.get("category", "")).lower()
-            q_type = str(q.get("quest_type", "")).lower()
 
-            # Prefer project / build / challenge quests
-            if q_cat in ("coding", "projects") or q_type in ("build", "project", "challenge"):
+        if act_type == "github_commit":
+            # Priority 1: Both repository and specific task keywords match
+            for q in quests:
+                q_title = str(q.get("title", "")).lower()
+                q_desc = str(q.get("description", "")).lower()
+                q_cat = str(q.get("category", "")).lower()
+                q_type = str(q.get("quest_type", "")).lower()
+                if q_cat not in ("coding", "projects", "learning") and q_type not in ("build", "project", "challenge", "learning"):
+                    continue
+
+                repo_match = bool(repo and (repo in q_title or repo in q_desc))
+                q_words = [w for w in re.findall(r'\b[a-z]{3,}\b', q_title) if w not in ('the', 'and', 'for', 'with', 'implement', 'build', 'create', 'update')]
+                commit_words = re.findall(r'\b[a-z]{3,}\b', act_title_lower)
+                keyword_match = any(qw in commit_words for qw in q_words)
+
+                if repo_match and keyword_match:
+                    return q
+
+            # Priority 2: Specific task keyword match between commit title and quest title
+            for q in quests:
+                q_title = str(q.get("title", "")).lower()
+                q_cat = str(q.get("category", "")).lower()
+                q_type = str(q.get("quest_type", "")).lower()
+                if q_cat not in ("coding", "projects") and q_type not in ("build", "project", "challenge"):
+                    continue
+
+                q_words = [w for w in re.findall(r'\b[a-z]{3,}\b', q_title) if w not in ('the', 'and', 'for', 'with', 'implement', 'build', 'create', 'update')]
+                commit_words = re.findall(r'\b[a-z]{3,}\b', act_title_lower)
+                if any(qw in commit_words for qw in q_words):
+                    return q
+
+            # Priority 3: Specific repo match with engineering action keywords
+            for q in quests:
+                q_title = str(q.get("title", "")).lower()
+                q_desc = str(q.get("description", "")).lower()
+                q_cat = str(q.get("category", "")).lower()
+                q_type = str(q.get("quest_type", "")).lower()
+                if q_cat not in ("coding", "projects") and q_type not in ("build", "project", "challenge"):
+                    continue
+
                 if repo and (repo in q_title or repo in q_desc):
-                    return q
-                if any(w in act_title_lower for w in ["api", "router", "endpoint", "feat", "fix", "crud", "test", "build", "frontend", "backend"]):
-                    return q
+                    if any(w in act_title_lower for w in ["api", "router", "endpoint", "feat", "fix", "crud", "test", "build"]):
+                        return q
 
-        # Fallback to any active coding quest
-        for q in quests:
-            if str(q.get("category", "")).lower() == "coding":
-                return q
+        elif act_type == "github_repository":
+            # Repository events only match quests that are explicitly about repository setup
+            for q in quests:
+                q_title = str(q.get("title", "")).lower()
+                q_desc = str(q.get("description", "")).lower()
+                if repo and (repo in q_title or repo in q_desc):
+                    if any(w in q_title for w in ["repo", "repository", "setup", "initialize", "init", "scaffold"]):
+                        return q
 
     # 3. Calendar deadline matching
     elif act_type == "calendar_event":

@@ -935,7 +935,7 @@ def process_github_activity_sync(s: Session, u: User, sync_data: Dict[str, Any])
         # 2. If matched to an active quest, link authentic evidence
         if matched and matched_id and norm.activity_type in ('github_commit', 'github_repository'):
             q = s.get(Quest, matched_id)
-            if q and q.status in ('available', 'in_progress'):
+            if q:
                 repo = norm.metadata.get('repository') or 'repo'
                 sha = norm.metadata.get('sha') or ''
                 url = norm.metadata.get('url') or ''
@@ -984,21 +984,22 @@ def process_github_activity_sync(s: Session, u: User, sync_data: Dict[str, Any])
                     evidence_created_count += 1
                     matched_quest_titles.append(q.title)
 
-                    # 3. Update quest progression & rewards
-                    if q.assessment_required:
-                        # Quiz protection: attach evidence, mark in_progress, do NOT bypass quiz
-                        if q.status == 'available':
-                            q.status = 'in_progress'
-                        notify(s, u, 'GitHub Evidence Attached', f"Verified commit from {repo} attached to {q.title}. Complete the quiz assessment to claim rewards.", 'evidence')
-                    else:
-                        # Tangible coding/project quest: complete using authoritative RPG progression
-                        prog_res = complete_quest_progression(
-                            s, u, q,
-                            score=0.88,
-                            feedback=f"Completed with verified GitHub commit '{norm.title}' in repository {repo}."
-                        )
-                        total_xp_awarded += prog_res.get('earned_xp', 0)
-                        notify(s, u, 'Quest Cleared via GitHub', f"'{q.title}' completed via real GitHub commit! +{prog_res['earned_xp']} XP, +{prog_res['earned_coins']} coins.", 'quest')
+                    # 3. Update quest progression & rewards if quest is active
+                    if q.status in ('available', 'in_progress'):
+                        if q.assessment_required:
+                            # Quiz protection: attach evidence, mark in_progress, do NOT bypass quiz
+                            if q.status == 'available':
+                                q.status = 'in_progress'
+                            notify(s, u, 'GitHub Evidence Attached', f"Verified commit from {repo} attached to {q.title}. Complete the quiz assessment to claim rewards.", 'evidence')
+                        else:
+                            # Tangible coding/project quest: complete using authoritative RPG progression
+                            prog_res = complete_quest_progression(
+                                s, u, q,
+                                score=0.88,
+                                feedback=f"Completed with verified GitHub commit '{norm.title}' in repository {repo}."
+                            )
+                            total_xp_awarded += prog_res.get('earned_xp', 0)
+                            notify(s, u, 'Quest Cleared via GitHub', f"'{q.title}' completed via real GitHub commit! +{prog_res['earned_xp']} XP, +{prog_res['earned_coins']} coins.", 'quest')
 
     return {
         "new_activities": new_records_count,
