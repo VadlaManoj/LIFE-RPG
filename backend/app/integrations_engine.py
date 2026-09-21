@@ -826,59 +826,113 @@ def match_activity_to_quests(
 
     # 2. GitHub commit / repository matching
     elif act_type in ("github_commit", "github_repository"):
-        repo = str(act_meta.get("repository", "")).lower()
+        raw_repo = str(act_meta.get("repository", "")).lower()
+        repo_clean = re.sub(r'[-_./\s]+', ' ', raw_repo)
+        repo_tokens = set(re.findall(r'\b[a-z0-9]{2,}\b', repo_clean))
+        stop_words = {'the', 'and', 'for', 'with', 'from', 'this', 'that', 'into', 'your', 'have', 'action', 'quest', 'complete', 'toward', 'small', 'repeatable'}
+        
+        raw_commit_words = set(re.findall(r'\b[a-z0-9]{2,}\b', act_title_lower)) - stop_words
+        commit_words_longer = {w for w in raw_commit_words if len(w) >= 3 and w not in ('feat', 'fix', 'test', 'update', 'add', 'refactor', 'changes', 'commit', 'code')}
+
+        # Filter eligible quests for coding/projects/engineering
+        eligible = []
+        for q in quests:
+            q_cat = str(q.get("category", "")).lower()
+            q_type = str(q.get("quest_type", "")).lower()
+            q_skill = str(q.get("skill", "")).lower()
+            q_subject = str(q.get("subject", "")).lower()
+            goal_cat = str(q.get("goal_category", "")).lower()
+            goal_type = str(q.get("goal_type", "")).lower()
+
+            # Strictly reject non-engineering domains (Fitness, Health, Wellness, Relationships, Finance)
+            if q_cat in ("fitness", "health", "wellness", "finance", "relationships") or q_skill in ("fitness", "health", "wellness"):
+                continue
+
+            # Must be linked to code/project/learning/technical activity
+            is_coding_domain = (
+                q_cat in ("coding", "projects", "learning", "career", "personal") or
+                goal_cat in ("coding", "projects", "learning", "career", "personal")
+            )
+            is_coding_skill = (
+                any(k in q_skill for k in ["coding", "project", "python", "dsa", "software", "dev", "engineer", "fastapi", "web", "api"]) or
+                any(k in q_subject for k in ["python", "dsa", "coding"]) or
+                goal_type in ("project", "learning") or
+                q_type in ("build", "project", "challenge", "practice", "habit", "boss", "learning")
+            )
+            if is_coding_domain and is_coding_skill:
+                eligible.append(q)
+
+        if not eligible:
+            return None
 
         if act_type == "github_commit":
-            # Priority 1: Both repository and specific task keywords match
-            for q in quests:
+            best_match = None
+            best_score = 0
+
+            for q in eligible:
+                score = 0
                 q_title = str(q.get("title", "")).lower()
                 q_desc = str(q.get("description", "")).lower()
-                q_cat = str(q.get("category", "")).lower()
-                q_type = str(q.get("quest_type", "")).lower()
-                if q_cat not in ("coding", "projects", "learning") and q_type not in ("build", "project", "challenge", "learning"):
-                    continue
+                goal_title = str(q.get("goal_title", "")).lower()
+                q_skill = str(q.get("skill", "")).lower()
+                q_subject = str(q.get("subject", "")).lower()
+                q_topic = str(q.get("topic", "")).lower()
 
-                repo_match = bool(repo and (repo in q_title or repo in q_desc))
-                q_words = [w for w in re.findall(r'\b[a-z]{3,}\b', q_title) if w not in ('the', 'and', 'for', 'with', 'implement', 'build', 'create', 'update')]
-                commit_words = re.findall(r'\b[a-z]{3,}\b', act_title_lower)
-                keyword_match = any(qw in commit_words for qw in q_words)
+                q_title_tokens = set(re.findall(r'\b[a-z0-9]{2,}\b', q_title)) - stop_words
+                q_desc_tokens = set(re.findall(r'\b[a-z0-9]{2,}\b', q_desc)) - stop_words
+                goal_tokens = set(re.findall(r'\b[a-z0-9]{2,}\b', goal_title)) - stop_words
+                skill_tokens = set(re.findall(r'\b[a-z0-9]{2,}\b', f"{q_skill} {q_subject} {q_topic}")) - stop_words
 
-                if repo_match and keyword_match:
-                    return q
+                quest_all_tokens = q_title_tokens | q_desc_tokens | goal_tokens | skill_tokens
 
-            # Priority 2: Specific task keyword match between commit title and quest title
-            for q in quests:
-                q_title = str(q.get("title", "")).lower()
-                q_cat = str(q.get("category", "")).lower()
-                q_type = str(q.get("quest_type", "")).lower()
-                if q_cat not in ("coding", "projects") and q_type not in ("build", "project", "challenge"):
-                    continue
+                # Check repo match
+                repo_in_text = bool(
+                    raw_repo and (raw_repo in q_title or raw_repo in q_desc or raw_repo in goal_title)
+                ) or bool(
+                    repo_clean and (repo_clean in q_title or repo_clean in q_desc or repo_clean in goal_title)
+                )
 
-                q_words = [w for w in re.findall(r'\b[a-z]{3,}\b', q_title) if w not in ('the', 'and', 'for', 'with', 'implement', 'build', 'create', 'update')]
-                commit_words = re.findall(r'\b[a-z]{3,}\b', act_title_lower)
-                if any(qw in commit_words for qw in q_words):
-                    return q
+                # Meaningful repo token overlap (e.g. 'python', 'api', 'two', 'sum', 'fastapi', 'rpg')
+                meaningful_repo_tokens = {w for w in repo_tokens if w not in ('the', 'test', 'demo', 'app', 'new')}
+                repo_token_overlap = meaningful_repo_tokens & quest_all_tokens
 
-            # Priority 3: Specific repo match with engineering action keywords
-            for q in quests:
-                q_title = str(q.get("title", "")).lower()
-                q_desc = str(q.get("description", "")).lower()
-                q_cat = str(q.get("category", "")).lower()
-                q_type = str(q.get("quest_type", "")).lower()
-                if q_cat not in ("coding", "projects") and q_type not in ("build", "project", "challenge"):
-                    continue
+                # Check commit keyword overlap
+                overlap_title = raw_commit_words & q_title_tokens
+                overlap_desc = raw_commit_words & q_desc_tokens
+                overlap_goal = raw_commit_words & goal_tokens
+                overlap_skill = raw_commit_words & skill_tokens
+                all_keyword_overlap = commit_words_longer & quest_all_tokens
 
-                if repo and (repo in q_title or repo in q_desc):
-                    if any(w in act_title_lower for w in ["api", "router", "endpoint", "feat", "fix", "crud", "test", "build"]):
-                        return q
+                # Direct task match
+                if repo_in_text and (overlap_title or overlap_goal or all_keyword_overlap):
+                    score += 10
+                elif repo_token_overlap and (overlap_title or overlap_goal or all_keyword_overlap):
+                    score += 7
+                elif all_keyword_overlap:
+                    score += 5 + len(all_keyword_overlap)
+                elif (overlap_title or overlap_goal):
+                    score += 4
+                elif repo_token_overlap and any(w in act_title_lower for w in ["api", "router", "endpoint", "feat", "fix", "crud", "test", "build", "refactor", "changes", "update"]):
+                    score += 3
+
+                # Prefer active coding/project quests over generic when committing real code
+                if not q.get("assessment_required") and q.get("quest_type") in ("build", "project", "challenge", "practice", "habit"):
+                    score += 1
+
+                if score > best_score:
+                    best_score = score
+                    best_match = q
+
+            if best_score >= 3:
+                return best_match
 
         elif act_type == "github_repository":
-            # Repository events only match quests that are explicitly about repository setup
-            for q in quests:
+            for q in eligible:
                 q_title = str(q.get("title", "")).lower()
                 q_desc = str(q.get("description", "")).lower()
-                if repo and (repo in q_title or repo in q_desc):
-                    if any(w in q_title for w in ["repo", "repository", "setup", "initialize", "init", "scaffold"]):
+                goal_title = str(q.get("goal_title", "")).lower()
+                if raw_repo and (raw_repo in q_title or raw_repo in q_desc or raw_repo in goal_title):
+                    if any(w in q_title for w in ["repo", "repository", "setup", "initialize", "init", "scaffold", "build"]):
                         return q
 
     # 3. Calendar deadline matching
