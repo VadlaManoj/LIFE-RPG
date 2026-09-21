@@ -103,7 +103,7 @@ function App(){
  if(!dash||!me)return <div className="boot"><Gamepad2/><b>Loading your world…</b><span>Syncing your campaign</span></div>;
  if(!me.onboarding_done)return <Onboarding me={me} onDone={async()=>{await load();setPage('home')}}/>;
  const refresh=async()=>{setLoading(true);try{await load()}finally{setLoading(false)}};
- return <><Shell page={page} setPage={setPage} dash={dash} me={me} logout={logout} refresh={refresh} loading={loading}>{page==='home'&&<Dashboard dash={dash} setPage={setPage} refresh={refresh}/>} {page==='goals'&&<Goals setPage={setPage} refresh={refresh}/>} {page==='campaign'&&<Campaign/>} {page==='quests'&&<QuestBoard dash={dash} refresh={refresh}/>} {page==='skills'&&<SkillTree/>} {page==='hero'&&<Hero/>} {page==='missions'&&<Missions refresh={refresh}/>} {page==='boss'&&<Bosses/>} {page==='analytics'&&<Analytics/>} {page==='journal'&&<Journal/>} {page==='review'&&<Weekly/>} {page==='achievements'&&<Achievements/>} {page==='social'&&<Social/>} {page==='integrations'&&<Integrations/>} {page==='notifications'&&<Notifications/>} {page==='settings'&&<SettingsPage me={me} refresh={refresh}/>}</Shell>{toast&&<div className="toast">{toast}<button onClick={()=>setToast('')}><X/></button></div>}</>;
+ return <><Shell page={page} setPage={setPage} dash={dash} me={me} logout={logout} refresh={refresh} loading={loading}>{page==='home'&&<Dashboard dash={dash} setPage={setPage} refresh={refresh}/>} {page==='goals'&&<Goals setPage={setPage} refresh={refresh}/>} {page==='campaign'&&<Campaign/>} {page==='quests'&&<QuestBoard dash={dash} refresh={refresh}/>} {page==='skills'&&<SkillTree/>} {page==='hero'&&<Hero/>} {page==='missions'&&<Missions refresh={refresh}/>} {page==='boss'&&<Bosses/>} {page==='analytics'&&<Analytics/>} {page==='journal'&&<Journal/>} {page==='review'&&<Weekly/>} {page==='achievements'&&<Achievements/>} {page==='social'&&<Social/>} {page==='integrations'&&<Integrations refresh={refresh}/>} {page==='notifications'&&<Notifications/>} {page==='settings'&&<SettingsPage me={me} refresh={refresh}/>}</Shell>{toast&&<div className="toast">{toast}<button onClick={()=>setToast('')}><X/></button></div>}</>;
 }
 function WorldEntry(){
  return <div className="worldEntry" aria-label="Entering LIFE RPG">
@@ -242,7 +242,7 @@ function Journal(){const [rows,setRows]=useState([]),[form,setForm]=useState({le
 function Weekly(){const [r,setR]=useState(null);useEffect(()=>{request('/weekly-review').then(setR)},[]);if(!r)return <Loading/>;return <div className="page"><PageTitle eyebrow="WEEKLY REVIEW" title={<>Your week, <em>decoded.</em></>} text="The Game Master summarizes the last seven days and sets a focused next-week priority."/><div className="reviewHero"><Sparkles/><div><small>GAME MASTER</small><h2>{r.game_master}</h2><p>{r.next_week}</p></div></div><div className="statGrid"><Stat icon={Zap} label="XP" value={`+${r.xp}`} sub="this week"/><Stat icon={Swords} label="Quests" value={r.quests} sub="assessed"/><Stat icon={Target} label="Average" value={`${r.average}%`} sub="performance"/><Stat icon={Flame} label="Streak" value={r.streak} sub="days"/></div><div className="twoCol"><div className="panel"><small>STRONGEST</small><h2>{r.strongest}</h2><p>Keep using this strength as a bridge into harder quests.</p></div><div className="panel"><small>NEEDS ATTENTION</small><h2>{r.weakest}</h2><p>Give this skill one focused quest next week.</p></div></div></div>}
 function Achievements(){const [rows,setRows]=useState([]);useEffect(()=>{request('/achievements').then(setRows)},[]);return <div className="page"><PageTitle eyebrow="ACHIEVEMENTS" title={<>Make progress <em>visible.</em></>} text="Badges celebrate meaningful milestones without replacing the real-world outcome."/><div className="achievementGrid">{rows.map(a=><div className={`achievement ${a.unlocked?'unlocked':''}`} key={a.id}><div className="achievementIcon">{a.icon}</div><div><h3>{a.title}</h3><p>{a.description}</p></div>{a.unlocked?<Check/>:<Lock/>}</div>)}</div></div>}
 function Social(){const [d,setD]=useState(null),[name,setName]=useState('');const load=()=>request('/social').then(setD);useEffect(()=>{load()},[]);if(!d)return <Loading/>;const add=async()=>{if(name.trim()){await request('/social/friends',{method:'POST',body:JSON.stringify({name})});setName('');load()}};return <div className="page"><PageTitle eyebrow="COMMUNITY" title={<>Accountability without the <em>noise.</em></>} text="Friends, shared challenges and leaderboards sit around the solo campaign rather than replacing it."/><div className="twoCol"><div className="panel"><PanelHead title="Leaderboard" icon={Users}/>{d.leaderboard.map((x,i)=><div className={`leader ${x.you?'you':''}`} key={x.name}><b>#{i+1}</b><span className="miniAvatar">{avatarEmoji(i===0?'mage':'knight')}</span><strong>{x.name}</strong><span>LVL {x.level}</span><b>{x.xp.toLocaleString()} XP</b></div>)}</div><div><div className="panel"><PanelHead title="Weekly challenge" icon={Trophy}/><h3>{d.challenge?.title}</h3><div className="bar"><i style={{width:`${Math.round((d.challenge?.progress||0)/(d.challenge?.target||1)*100)}%`}}/></div><p>{d.challenge?.progress}/{d.challenge?.target} quests · +{d.challenge?.reward} XP</p></div><div className="panel"><h3>Add accountability friend</h3><div className="inline"><input value={name} onChange={e=>setName(e.target.value)} placeholder="Friend name"/><button className="primary" onClick={add}><Plus/></button></div></div></div></div></div>}
-function Integrations(){
+function Integrations({refresh}){
   const [rows,setRows]=useState([]), [syncing,setSyncing]=useState({}), [activities,setActivities]=useState([]);
   const [fitType,setFitType]=useState('walk'), [fitMins,setFitMins]=useState(30), [fitSteps,setFitSteps]=useState(3500), [fitMsg,setFitMsg]=useState('');
   const [bridgeData,setBridgeData]=useState(null), [showBridge,setShowBridge]=useState(false), [copied,setCopied]=useState(false);
@@ -283,6 +283,7 @@ function Integrations(){
     try{
       await request(`/integrations/${p.provider}/disconnect`,{method:'POST'});
       await load();
+      if(refresh) await refresh();
     }catch(e){
       alert(`Disconnect error: ${e.message}`);
     }
@@ -291,8 +292,14 @@ function Integrations(){
   const syncProvider=async p=>{
     setSyncing(s=>({...s,[p.provider]:true}));
     try{
-      await request(`/integrations/${p.provider}/sync`,{method:'POST'});
+      const res=await request(`/integrations/${p.provider}/sync`,{method:'POST'});
       await load();
+      if(refresh) await refresh();
+      const awarded = res?.sync_stats?.total_xp_awarded || 0;
+      if(awarded > 0){
+        const quests = res?.sync_stats?.matched_quests?.join(', ') || 'Active Quest';
+        alert(`🎉 ${p.provider} Sync Complete!\n\n+${awarded} XP Awarded!\nQuests Cleared: ${quests}`);
+      }
     }catch(e){
       alert(`Sync error: ${e.message}`);
     }finally{
@@ -327,7 +334,8 @@ function Integrations(){
       });
       setFitMsg(`Logged! +${res.earned_xp} XP and +${res.earned_coins} coins awarded.`);
       setTimeout(()=>setFitMsg(''),5000);
-      load();
+      await load();
+      if(refresh) await refresh();
     }catch(err){
       alert(err.message);
     }
