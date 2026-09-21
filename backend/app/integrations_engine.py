@@ -826,12 +826,17 @@ def match_activity_to_quests(
 
     # 2. GitHub commit / repository matching
     elif act_type in ("github_commit", "github_repository"):
+        stop_words = {'the', 'and', 'for', 'with', 'from', 'this', 'that', 'into', 'your', 'have', 'action', 'quest', 'complete', 'toward', 'small', 'repeatable'}
+        def _tokens(text: str) -> set:
+            if not text:
+                return set()
+            cleaned = re.sub(r'[^a-zA-Z0-9]+', ' ', str(text)).lower()
+            return {w for w in cleaned.split() if len(w) >= 2 and w not in stop_words}
+
         raw_repo = str(act_meta.get("repository", "")).lower()
         repo_clean = re.sub(r'[-_./\s]+', ' ', raw_repo)
-        repo_tokens = set(re.findall(r'\b[a-z0-9]{2,}\b', repo_clean))
-        stop_words = {'the', 'and', 'for', 'with', 'from', 'this', 'that', 'into', 'your', 'have', 'action', 'quest', 'complete', 'toward', 'small', 'repeatable'}
-        
-        raw_commit_words = set(re.findall(r'\b[a-z0-9]{2,}\b', act_title_lower)) - stop_words
+        repo_tokens = _tokens(raw_repo)
+        raw_commit_words = _tokens(act_title_lower)
         commit_words_longer = {w for w in raw_commit_words if len(w) >= 3 and w not in ('feat', 'fix', 'test', 'update', 'add', 'refactor', 'changes', 'commit', 'code')}
 
         # Filter eligible quests for coding/projects/engineering
@@ -878,10 +883,10 @@ def match_activity_to_quests(
                 q_subject = str(q.get("subject", "")).lower()
                 q_topic = str(q.get("topic", "")).lower()
 
-                q_title_tokens = set(re.findall(r'\b[a-z0-9]{2,}\b', q_title)) - stop_words
-                q_desc_tokens = set(re.findall(r'\b[a-z0-9]{2,}\b', q_desc)) - stop_words
-                goal_tokens = set(re.findall(r'\b[a-z0-9]{2,}\b', goal_title)) - stop_words
-                skill_tokens = set(re.findall(r'\b[a-z0-9]{2,}\b', f"{q_skill} {q_subject} {q_topic}")) - stop_words
+                q_title_tokens = _tokens(q_title)
+                q_desc_tokens = _tokens(q_desc)
+                goal_tokens = _tokens(goal_title)
+                skill_tokens = _tokens(f"{q_skill} {q_subject} {q_topic}")
 
                 quest_all_tokens = q_title_tokens | q_desc_tokens | goal_tokens | skill_tokens
 
