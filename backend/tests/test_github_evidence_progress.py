@@ -568,7 +568,7 @@ class TestGitHubEvidenceAndProgress(unittest.TestCase):
         resp = self.client.post("/api/integrations/GitHub/sync", headers=self.auth_headers())
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
-        print("DEBUG test_e data:", data)
+
         # Assertions on sync_stats
         self.assertEqual(data["sync_stats"]["evidence_created"], 1)
         self.assertGreater(data["sync_stats"]["total_xp_awarded"], 0)
