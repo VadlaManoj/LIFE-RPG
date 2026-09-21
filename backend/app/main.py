@@ -904,7 +904,19 @@ def process_github_activity_sync(s: Session, u: User, sync_data: Dict[str, Any])
     commit/repo evidence to matching quests without duplicating evidence or bypassing quiz requirements.
     """
     raw_items = sync_data.get('items', [])
-    active_quests = [clean(q) for q in s.query(Quest).join(Goal).filter(Goal.user_id == u.id, Quest.status.in_(['available', 'in_progress'])).all()]
+    active_quest_rows = (
+        s.query(Quest, Goal)
+        .join(Goal, Quest.goal_id == Goal.id)
+        .filter(Goal.user_id == u.id, Quest.status.in_(['available', 'in_progress']))
+        .all()
+    )
+    active_quests = []
+    for q_obj, g_obj in active_quest_rows:
+        qd = clean(q_obj)
+        qd['goal_title'] = g_obj.title
+        qd['goal_category'] = g_obj.category
+        qd['goal_type'] = g_obj.goal_type
+        active_quests.append(qd)
 
     matched_quest_titles = []
     evidence_created_count = 0
@@ -917,26 +929,34 @@ def process_github_activity_sync(s: Session, u: User, sync_data: Dict[str, Any])
 
         # 1. Deduplication via UnifiedActivityRecord
         existing = s.query(UnifiedActivityRecord).filter_by(user_id=u.id, external_id=ext_id).first() if ext_id else None
-        if existing:
-            # Already synced: skip to prevent duplicate activity, duplicate evidence, and double progress
+        if existing and existing.matched_quest_id is not None:
+            # Already synced and matched: skip to prevent duplicate activity & XP
             continue
 
         matched = match_activity_to_quests(norm, active_quests)
         matched_id = matched['id'] if matched else None
 
-        rec = UnifiedActivityRecord(
-            user_id=u.id,
-            provider="GitHub",
-            activity_type=norm.activity_type,
-            title=norm.title,
-            description=norm.description,
-            external_id=ext_id,
-            timestamp=norm.timestamp,
-            metadata_json=json.dumps(norm.metadata),
-            matched_quest_id=matched_id
-        )
-        s.add(rec)
-        new_records_count += 1
+        if existing:
+            if not matched_id:
+                # Still unmatched: skip
+                continue
+            # Previously unmatched activity now matches an active quest!
+            existing.matched_quest_id = matched_id
+            rec = existing
+        else:
+            rec = UnifiedActivityRecord(
+                user_id=u.id,
+                provider="GitHub",
+                activity_type=norm.activity_type,
+                title=norm.title,
+                description=norm.description,
+                external_id=ext_id,
+                timestamp=norm.timestamp,
+                metadata_json=json.dumps(norm.metadata),
+                matched_quest_id=matched_id
+            )
+            s.add(rec)
+            new_records_count += 1
 
         # 2. If matched to an active quest, link authentic evidence
         if matched and matched_id and norm.activity_type in ('github_commit', 'github_repository'):
@@ -946,14 +966,14 @@ def process_github_activity_sync(s: Session, u: User, sync_data: Dict[str, Any])
                 sha = norm.metadata.get('sha') or ''
                 url = norm.metadata.get('url') or ''
 
-                # Check for duplicate Evidence for this specific commit and quest
-                existing_ev = s.query(Evidence).filter_by(quest_id=q.id, user_id=u.id, kind='github').all()
+                # Check for duplicate Evidence across this user's github evidence
+                existing_ev = s.query(Evidence).filter_by(user_id=u.id, kind='github').all()
                 is_duplicate_ev = False
                 for ev in existing_ev:
-                    if sha and ev.filename == sha:
+                    if sha and (ev.filename == sha or sha in (ev.value or '')):
                         is_duplicate_ev = True
                         break
-                    if url and url in (ev.value or ''):
+                    if url and (ev.value and url in ev.value):
                         is_duplicate_ev = True
                         break
 
@@ -1004,9 +1024,17 @@ def process_github_activity_sync(s: Session, u: User, sync_data: Dict[str, Any])
                                 score=0.88,
                                 feedback=f"Completed with verified GitHub commit '{norm.title}' in repository {repo}."
                             )
-                            total_xp_awarded += prog_res.get('earned_xp', 0)
-                            notify(s, u, 'Quest Cleared via GitHub', f"'{q.title}' completed via real GitHub commit! +{prog_res['earned_xp']} XP, +{prog_res['earned_coins']} coins.", 'quest')
+                            earned_xp = prog_res.get('earned_xp', 0)
+                            total_xp_awarded += earned_xp
+                            notify(s, u, 'Quest Cleared via GitHub', f"'{q.title}' completed via real GitHub commit! +{earned_xp} XP, +{prog_res.get('earned_coins', 0)} coins.", 'quest')
 
+                            # Update active_quests list so subsequent distinct items can progress newly unlocked quests
+                            active_quests = [aq for aq in active_quests if aq.get('id') != q.id]
+                            if prog_res.get('next_quest'):
+                                nq = prog_res['next_quest']
+                                active_quests.append(nq)
+
+    s.flush()
     return {
         "new_activities": new_records_count,
         "evidence_created": evidence_created_count,
@@ -1627,7 +1655,11 @@ async def sync_integration_endpoint(provider: str, s: Session=Depends(db), u: Us
             "is_live": it.is_live,
             "last_sync_at": it.last_sync_at.isoformat() if it.last_sync_at else None,
             "data": sync_result,
-            "sync_stats": sync_stats
+            "sync_stats": sync_stats,
+            "user": clean(u),
+            "total_xp": u.xp,
+            "level": u.level,
+            "coins": u.coins
         }
     except Exception as exc:
         it.sync_status = 'failed'
