@@ -16,7 +16,7 @@ class TestGitHubEvidenceAndProgress(unittest.TestCase):
         cls.client = TestClient(app)
         cls.db = SessionLocal()
 
-        # Clean up existing test user
+        # Clean up existing test user (full, ordered cleanup)
         old_u = cls.db.query(User).filter_by(email="github_progress_tester@test.com").first()
         if old_u:
             cls.cleanup_user(old_u.id)
@@ -36,6 +36,20 @@ class TestGitHubEvidenceAndProgress(unittest.TestCase):
         cls.db.refresh(cls.user)
         cls.token = token_for(cls.user.id)
 
+        # Pre-create a connected GitHub integration so all tests that need it work
+        # even when run out of sequence or in full suite context.
+        it = Integration(
+            user_id=cls.user.id,
+            provider="GitHub",
+            connected=True,
+            status="connected",
+            is_live=True,
+            access_token_enc=encrypt_token("gho_test_valid_access_token_123"),
+            account_name="hero_dev"
+        )
+        cls.db.add(it)
+        cls.db.commit()
+
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, 'user') and cls.user:
@@ -44,15 +58,22 @@ class TestGitHubEvidenceAndProgress(unittest.TestCase):
 
     @classmethod
     def cleanup_user(cls, uid):
+        """Safely removes all data for a user in the correct FK order."""
         s = cls.db
+        # Get all goals for this user
         gids = [g.id for g in s.query(Goal).filter_by(user_id=uid).all()]
+        # Get all quests for those goals
         qids = [q.id for q in s.query(Quest).filter(Quest.goal_id.in_(gids)).all()] if gids else []
+        # Delete in FK dependency order
         if qids:
             s.query(Evidence).filter(Evidence.quest_id.in_(qids)).delete(synchronize_session=False)
             s.query(Assessment).filter(Assessment.quest_id.in_(qids)).delete(synchronize_session=False)
             s.query(Quest).filter(Quest.id.in_(qids)).delete(synchronize_session=False)
         if gids:
-            s.query(Milestone).delete(synchronize_session=False)
+            # Get campaign IDs for this user's goals to scope milestone deletion correctly
+            camp_ids = [c.id for c in s.query(Campaign).filter_by(user_id=uid).all()]
+            if camp_ids:
+                s.query(Milestone).filter(Milestone.campaign_id.in_(camp_ids)).delete(synchronize_session=False)
             s.query(Campaign).filter_by(user_id=uid).delete(synchronize_session=False)
             s.query(Goal).filter_by(user_id=uid).delete(synchronize_session=False)
         s.query(Skill).filter_by(user_id=uid).delete(synchronize_session=False)
@@ -130,21 +151,10 @@ class TestGitHubEvidenceAndProgress(unittest.TestCase):
         record with repository, commit title, URL, sha, and updates quest status & user XP.
         """
         goal, ms, q1, q2 = self._setup_coding_campaign()
+        # Refresh user to get current (clean) XP/coins from DB
+        self.db.refresh(self.user)
         initial_xp = self.user.xp
         initial_coins = self.user.coins
-
-        # Setup connected GitHub integration record
-        it = Integration(
-            user_id=self.user.id,
-            provider="GitHub",
-            connected=True,
-            status="connected",
-            is_live=True,
-            access_token_enc=encrypt_token("gho_test_valid_access_token_123"),
-            account_name="hero_dev"
-        )
-        self.db.add(it)
-        self.db.commit()
 
         mock_client = AsyncMock()
         mock_client_cls.return_value.__aenter__.return_value = mock_client
@@ -211,8 +221,15 @@ class TestGitHubEvidenceAndProgress(unittest.TestCase):
         self.assertEqual(q1.status, "completed")
         self.assertIsNotNone(q1.completed_at)
 
-        # Verify Assessment
-        assess = self.db.query(Assessment).filter_by(quest_id=q1.id, user_id=self.user.id).first()
+        # Verify Assessment — use the most recent Assessment for this quest to be robust
+        # against stale data from previous runs in the same DB
+        from sqlalchemy import desc
+        assess = (
+            self.db.query(Assessment)
+            .filter_by(quest_id=q1.id, user_id=self.user.id)
+            .order_by(desc(Assessment.id))
+            .first()
+        )
         self.assertIsNotNone(assess)
         self.assertGreaterEqual(assess.score, 0.8)
 
@@ -350,6 +367,27 @@ class TestGitHubEvidenceAndProgress(unittest.TestCase):
         2. API rate limit / forbidden (403 from GitHub API) -> handled safely.
         3. Missing access token -> raises clean error, no simulation demo data returned.
         """
+        # Ensure there is a connected GitHub integration for this user (idempotent upsert)
+        it = self.db.query(Integration).filter_by(user_id=self.user.id, provider="GitHub").first()
+        if not it:
+            it = Integration(
+                user_id=self.user.id,
+                provider="GitHub",
+                connected=True,
+                status="connected",
+                is_live=True,
+                access_token_enc=encrypt_token("gho_test_valid_access_token_123"),
+                account_name="hero_dev"
+            )
+            self.db.add(it)
+        else:
+            # Re-set to connected state in case a previous test left it in 'failed'
+            it.connected = True
+            it.status = "connected"
+            it.access_token_enc = encrypt_token("gho_test_valid_access_token_123")
+        self.db.commit()
+        self.db.refresh(it)
+
         # 1. Test expired token (HTTP 401)
         mock_client = AsyncMock()
         mock_client_cls.return_value.__aenter__.return_value = mock_client
@@ -362,9 +400,17 @@ class TestGitHubEvidenceAndProgress(unittest.TestCase):
         self.assertIn("expired or revoked", resp.json()["detail"])
 
         # Check DB status was safely updated to failed
-        it = self.db.query(Integration).filter_by(user_id=self.user.id, provider="GitHub").first()
+        self.db.refresh(it)
         self.assertEqual(it.sync_status, "failed")
         self.assertIn("expired or revoked", it.error_message)
+
+        # Re-connect for the 403 test
+        it.connected = True
+        it.status = "connected"
+        it.sync_status = "idle"
+        it.error_message = ""
+        it.access_token_enc = encrypt_token("gho_test_valid_access_token_123")
+        self.db.commit()
 
         # 2. Test rate limit (HTTP 403)
         mock_resp_403 = MagicMock()

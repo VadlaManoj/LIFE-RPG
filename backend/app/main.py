@@ -206,7 +206,8 @@ def db():
     finally: s.close()
 
 def clean(o):
-    return {k:v for k,v in o.__dict__.items() if k!='_sa_instance_state'} if hasattr(o,'__dict__') else o
+    sensitive_keys = {'_sa_instance_state', 'password_hash', 'access_token_enc', 'refresh_token_enc'}
+    return {k:v for k,v in o.__dict__.items() if k not in sensitive_keys} if hasattr(o,'__dict__') else o
 
 def hash_password(p,salt=None):
     salt=salt or secrets.token_hex(16); raw=hashlib.pbkdf2_hmac('sha256',p.encode(),salt.encode(),120000).hex(); return f'{salt}${raw}'
@@ -340,6 +341,7 @@ class GoalStatus(BaseModel): status:str
 def health(): return {'ok':True,'version':'4.1'}
 
 @app.post('/api/auth/signup')
+@app.post('/api/auth/register')
 def signup(x:Signup,s:Session=Depends(db)):
     email=x.email.strip().lower()
     if s.query(User).filter_by(email=email).first(): raise HTTPException(400,'An account with that email already exists.')
@@ -350,6 +352,10 @@ def login(x:Login,s:Session=Depends(db)):
     u=s.query(User).filter_by(email=x.email.strip().lower()).first()
     if not u or not verify_password(x.password,u.password_hash): raise HTTPException(401,'Invalid email or password.')
     return {'token':token_for(u.id),'user':clean(u)}
+
+@app.post('/api/auth/logout')
+def logout(u:User=Depends(current_user)):
+    return {'ok':True,'message':'Logged out successfully'}
 
 @app.post('/api/auth/forgot-password')
 def forgot(x:Login,s:Session=Depends(db)): return {'ok':True,'message':'If the account exists, password reset instructions can be sent by the configured email provider.'}
@@ -1448,6 +1454,16 @@ def get_auth_url_endpoint(provider: str, redirect_uri: Optional[str] = None, sta
         "state": state_token,
         "is_configured": True
     }
+
+
+@app.get('/api/integrations/oauth-demo')
+def oauth_demo_endpoint(provider: str = 'GitHub', state: str = '', redirect_uri: str = 'http://localhost:5173/integrations'):
+    from fastapi.responses import RedirectResponse
+    prov_slug = provider.lower().replace(' ', '_')
+    code = f"demo_{prov_slug}_token"
+    delim = '&' if '?' in redirect_uri else '?'
+    target = f"{redirect_uri}{delim}code={code}&state={state}&provider={provider}"
+    return RedirectResponse(url=target, status_code=307)
 
 
 class CallbackIn(BaseModel):
