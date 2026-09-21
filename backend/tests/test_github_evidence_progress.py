@@ -427,3 +427,180 @@ class TestGitHubEvidenceAndProgress(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             asyncio.run(gh_prov.sync(""))
         self.assertIn("missing or invalid", str(cm.exception))
+
+    @patch("httpx.AsyncClient")
+    def test_e_regression_real_browser_flow_with_two_sum_project_and_commits(self, mock_client_cls):
+        """
+        Regression Test reproducing the REAL user flow:
+        - User creates a project goal ('Add two_sum project in github') via natural flow.
+        - Has active quest ('Define Scope Action', habit/project type, category Learning, assessment_required=False).
+        - Connects real GitHub and syncs commit ('Two sum testing updates' in repo 'life-rpg-python-test').
+        - Asserts XP_AFTER > XP_BEFORE.
+        - Asserts authentic Evidence created and verified.
+        - Asserts quest completed and next quest unlocked.
+        - Asserts re-sync does NOT award duplicate XP.
+        """
+        # Ensure integration is live and connected
+        it = self.db.query(Integration).filter_by(user_id=self.user.id, provider="GitHub").first()
+        it.connected = True
+        it.status = "connected"
+        it.is_live = True
+        it.access_token_enc = encrypt_token("gho_real_user_flow_token_123")
+        it.account_name = "techy-ops"
+        self.db.commit()
+
+        # Create the real user's goal and campaign
+        goal = Goal(
+            user_id=self.user.id,
+            title="Add two_sum project in github",
+            category="Learning",
+            goal_type="project",
+            progress=0.0
+        )
+        self.db.add(goal)
+        self.db.commit()
+
+        camp = Campaign(
+            user_id=self.user.id,
+            goal_id=goal.id,
+            title="Add two_sum project in github",
+            summary="Two sum coding project campaign"
+        )
+        self.db.add(camp)
+        self.db.commit()
+
+        m1 = Milestone(
+            campaign_id=camp.id,
+            title="Define Scope",
+            description="Define Scope for two_sum project",
+            order_index=1,
+            status="active",
+            reward_xp=120,
+            reward_coins=30
+        )
+        m2 = Milestone(
+            campaign_id=camp.id,
+            title="Foundation Build",
+            description="Foundation Build for two_sum project",
+            order_index=2,
+            status="locked",
+            reward_xp=150,
+            reward_coins=40
+        )
+        self.db.add(m1)
+        self.db.add(m2)
+        self.db.commit()
+
+        q1 = Quest(
+            goal_id=goal.id,
+            milestone_id=m1.id,
+            title="Define Scope Action",
+            description="Complete one small repeatable action toward Add two_sum project in github.",
+            quest_type="habit",
+            category="Learning",
+            difficulty=1,
+            xp=60,
+            coin_reward=18,
+            status="available",
+            order_index=0,
+            skill="Projects",
+            evidence_required=False,
+            assessment_required=False
+        )
+        q2 = Quest(
+            goal_id=goal.id,
+            milestone_id=m2.id,
+            title="Foundation Build Quest",
+            description="Learn and explain the essential ideas behind Add two_sum project in github.",
+            quest_type="learning",
+            category="Learning",
+            difficulty=1,
+            xp=70,
+            coin_reward=20,
+            status="locked",
+            order_index=1,
+            skill="Projects",
+            evidence_required=False,
+            assessment_required=False
+        )
+        self.db.add(q1)
+        self.db.add(q2)
+        self.db.commit()
+
+        # Record XP before sync
+        self.db.refresh(self.user)
+        xp_before = self.user.xp
+        coins_before = self.user.coins
+
+        # Mock GitHub API response with real commit data
+        mock_client = AsyncMock()
+        mock_client_cls.return_value.__aenter__.return_value = mock_client
+
+        mock_repos_resp = MagicMock()
+        mock_repos_resp.status_code = 200
+        mock_repos_resp.json.return_value = [
+            {
+                "id": 9901,
+                "name": "life-rpg-python-test",
+                "description": "Python test repo",
+                "html_url": "https://github.com/techy-ops/life-rpg-python-test",
+                "updated_at": "2026-09-21T16:32:00Z",
+                "owner": {"login": "techy-ops"}
+            }
+        ]
+
+        commit_sha = "f179a2c610007d46a0fbeeb"
+        mock_commits_resp = MagicMock()
+        mock_commits_resp.status_code = 200
+        mock_commits_resp.json.return_value = [
+            {
+                "sha": commit_sha,
+                "commit": {
+                    "message": "Two sum testing updates",
+                    "author": {"name": "Krishna Keerthana", "date": "2026-09-21T16:30:00Z"}
+                },
+                "html_url": f"https://github.com/techy-ops/life-rpg-python-test/commit/{commit_sha}"
+            }
+        ]
+        mock_client.get.side_effect = [mock_repos_resp, mock_commits_resp]
+
+        # Call POST /api/integrations/GitHub/sync (exact browser endpoint)
+        resp = self.client.post("/api/integrations/GitHub/sync", headers=self.auth_headers())
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+
+        # Assertions on sync_stats
+        self.assertEqual(data["sync_stats"]["evidence_created"], 1)
+        self.assertGreater(data["sync_stats"]["total_xp_awarded"], 0)
+        self.assertIn("Define Scope Action", data["sync_stats"]["matched_quests"])
+
+        # Check DB user XP updated
+        self.db.refresh(self.user)
+        xp_after = self.user.xp
+        self.assertGreater(xp_after, xp_before, "REAL BUG ASSERTION: XP_AFTER must be greater than XP_BEFORE")
+        self.assertEqual(xp_after - xp_before, data["sync_stats"]["total_xp_awarded"])
+        self.assertGreater(self.user.coins, coins_before)
+
+        # Check Evidence created in DB
+        ev = self.db.query(Evidence).filter_by(quest_id=q1.id, user_id=self.user.id, kind="github").first()
+        self.assertIsNotNone(ev)
+        self.assertTrue(ev.supports_quest)
+        self.assertGreaterEqual(ev.quality, 80.0)
+        self.assertIn("f179a2c6", ev.filename)
+
+        # Check quest1 completed and quest2 unlocked
+        self.db.refresh(q1)
+        self.assertEqual(q1.status, "completed")
+        self.db.refresh(q2)
+        self.assertEqual(q2.status, "available")
+
+        # Duplicate Sync Check: Resync must NOT award XP twice
+        mock_client.get.side_effect = [mock_repos_resp, mock_commits_resp]
+        resp2 = self.client.post("/api/integrations/GitHub/sync", headers=self.auth_headers())
+        self.assertEqual(resp2.status_code, 200)
+        data2 = resp2.json()
+        self.assertEqual(data2["sync_stats"]["evidence_created"], 0)
+        self.assertEqual(data2["sync_stats"]["total_xp_awarded"], 0)
+
+        self.db.refresh(self.user)
+        self.assertEqual(self.user.xp, xp_after, "Duplicate sync must NOT increase XP twice")
