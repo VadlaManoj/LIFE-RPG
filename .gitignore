@@ -11,3 +11,10 @@ __pycache__/
 **/.gradle/
 **/__pycache__/
 **/*.pyc
+
+# Generated Android build files
+**/build/
+
+.env
+.env.*
+!.env.example
