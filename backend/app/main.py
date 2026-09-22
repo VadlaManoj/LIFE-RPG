@@ -1459,7 +1459,7 @@ def get_auth_url_endpoint(provider: str, redirect_uri: Optional[str] = None, sta
     env_redirect = os.getenv(f"{prov.name.upper().replace(' ', '_')}_REDIRECT_URI")
     effective_redirect = redirect_uri or env_redirect or 'http://localhost:5173/integrations'
     # Whitelist redirect URIs to prevent open-redirect vulnerabilities
-    allowed_hosts = ['localhost', '127.0.0.1']
+    allowed_hosts = ['localhost','127.0.0.1','life-rpg-phi-two.vercel.app']
     try:
         from urllib.parse import urlparse
         parsed = urlparse(effective_redirect)
